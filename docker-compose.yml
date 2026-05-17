@@ -1,0 +1,95 @@
+version: "3.9"
+
+services:
+
+  # ── Spring Boot API ────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: resume-shaper-api
+    ports:
+      - "8080:8080"
+    environment:
+      # Database
+      DB_URL:      jdbc:postgresql://postgres:5432/resumeshaper
+      DB_USERNAME: resumeshaper
+      DB_PASSWORD: resumeshaper
+
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      # JWT – generate with: openssl rand -base64 64
+      JWT_SECRET: ${JWT_SECRET}
+
+      # Gemini
+      GEMINI_API_KEY: AIzaSyBWlpJkNUfQJcnGSXoFKC684Z68LHt-kGY
+
+      # AWS S3
+      S3_BUCKET:          ${S3_BUCKET}
+      AWS_REGION:         ${AWS_REGION:-ap-south-1}
+      AWS_ACCESS_KEY_ID:  ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+
+      # OAuth2
+      GOOGLE_CLIENT_ID:     ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GITHUB_CLIENT_ID:     ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      OAUTH2_REDIRECT_URI:  ${OAUTH2_REDIRECT_URI:-http://localhost:5173/auth/callback}
+
+      # CORS
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── PostgreSQL ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: resume-shaper-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB:       resumeshaper
+      POSTGRES_USER:     resumeshaper
+      POSTGRES_PASSWORD: resumeshaper
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resumeshaper"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Redis ──────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: resume-shaper-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
