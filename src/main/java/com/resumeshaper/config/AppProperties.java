@@ -34,7 +34,7 @@ public class AppProperties {
     @Data
     public static class Gemini {
         private String apiKey;
-        private String model = "gemini-2.0-flash";
+        private List<String> models = List.of("gemini-2.5-flash");  // String model → List<String> models
         private String baseUrl = "https://generativelanguage.googleapis.com/v1beta";
         private int timeoutSeconds = 60;
         private int maxOutputTokens = 8192;
@@ -54,12 +54,12 @@ public class AppProperties {
 
     @Data
     public static class Cors {
-        private List<String> allowedOrigins = List.of("http://localhost:3000");
+        private List<String> allowedOrigins = List.of("http://localhost:5173");
     }
 
     @Data
     public static class OAuth2 {
-        private String redirectUri = "http://localhost:3000/auth/callback";
+        private String redirectUri = "http://localhost:5173/auth/callback";
     }
 
     @Data

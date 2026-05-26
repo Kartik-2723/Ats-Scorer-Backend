@@ -39,20 +39,29 @@ public class SecurityConfig {
             .csrf(AbstractHttpConfigurer::disable)
             .cors(cors -> cors.configurationSource(corsConfigurationSource()))
             .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-            .authorizeHttpRequests(auth -> auth
-                // Public endpoints
-                .requestMatchers(HttpMethod.GET,  "/api/roles").permitAll()
-                .requestMatchers(HttpMethod.POST, "/api/guest/session").permitAll()
-                .requestMatchers(HttpMethod.POST, "/api/resume/upload").permitAll()
-                .requestMatchers(HttpMethod.POST, "/api/resume/process").permitAll()
-                .requestMatchers(HttpMethod.GET,  "/api/resume/download/**").permitAll()
-                .requestMatchers(HttpMethod.GET,  "/api/resume/status/**").permitAll()
-                .requestMatchers(HttpMethod.POST, "/api/jd/analyze").permitAll()
-                .requestMatchers("/api/auth/**").permitAll()
-                .requestMatchers("/actuator/health", "/actuator/info").permitAll()
-                // Everything else requires auth
-                .anyRequest().authenticated()
-            )
+                .authorizeHttpRequests(auth -> auth
+                        // Public endpoints
+                        .requestMatchers(HttpMethod.GET,  "/api/roles").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/guest/session").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/resume/upload").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/resume/process").permitAll()
+                        .requestMatchers(HttpMethod.GET,  "/api/resume/download/**").permitAll()
+                        .requestMatchers(HttpMethod.GET,  "/api/resume/status/**").permitAll()
+                        .requestMatchers(HttpMethod.GET,  "/api/resume/**").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/resume/{jobId}/reshape").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/jd/analyze").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/latex/compile").permitAll()
+                        .requestMatchers("/api/auth/refresh").permitAll()
+                        .requestMatchers("/api/auth/me").permitAll()
+                        .requestMatchers("/api/auth/oauth2/**").permitAll()
+                        .requestMatchers("/api/auth/otp/send").permitAll()
+                        .requestMatchers("/api/auth/otp/verify").permitAll()
+                        .requestMatchers("/api/latex/reshape/**").permitAll()
+                        .requestMatchers("/api/auth/claim-session").authenticated() // AuthController -> claim-session
+                        .requestMatchers("/actuator/health", "/actuator/info").permitAll()
+                        // Everything else requires auth
+                        .anyRequest().authenticated()
+                )
             .oauth2Login(oauth2 -> oauth2
                 .authorizationEndpoint(ep ->
                     ep.baseUri("/api/auth/oauth2/authorize"))

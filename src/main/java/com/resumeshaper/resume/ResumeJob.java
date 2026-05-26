@@ -13,7 +13,11 @@ import java.util.UUID;
 
 @Entity
 @Table(name = "resume_jobs")
-@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
 public class ResumeJob {
 
     @Id
@@ -53,7 +57,82 @@ public class ResumeJob {
     @Column(name = "shaped_file_key")
     private String shapedFileKey;
 
-    // JSONB columns
+    // ── LaTeX pipeline fields ────────────────────────────────────────────────
+
+    /**
+     * Whether the user uploaded a PDF or raw LaTeX.
+     * Null for jobs created via the old JSON-reshape pipeline.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "input_type", length = 10)
+    private InputType inputType;
+
+    /**
+     * Original LaTeX source:
+     *  - If inputType=LATEX: the raw uploaded .tex content
+     *  - If inputType=PDF:   the LLM-converted LaTeX from PDF text extraction
+     * Kept for audit and retry. Never sent to frontend.
+     */
+    @Column(name = "raw_latex", columnDefinition = "TEXT")
+    private String rawLatex;
+
+    /**
+     * Final reshaped + Tectonic-validated LaTeX.
+     * This is what the frontend editor receives and pre-renders.
+     */
+    @Column(name = "shaped_latex", columnDefinition = "TEXT")
+    private String shapedLatex;
+
+    /**
+     * S3 key of the backend-compiled PDF.
+     * Pre-signed URL generated on result fetch — frontend renders PDF
+     * instantly from Redis cache (LatexCompilerService caches by SHA-256).
+     */
+    @Column(name = "compiled_pdf_key")
+    private String compiledPdfKey;
+
+    /**
+     * How many Tectonic compile attempts have been made.
+     * Max 3 (1 initial + 2 LLM fix retries). If all fail → FAILED.
+     */
+    @Column(name = "latex_compile_attempts")
+    @Builder.Default
+    private int latexCompileAttempts = 0;
+
+    // ── Planner output fields (populated during RESHAPING_LATEX phase) ───────
+
+    /**
+     * Candidate career stage detected by the planner LLM.
+     * Values: STUDENT_FRESHER | EARLY_CAREER | MID_SENIOR | CAREER_SWITCHER
+     * Stored for analytics and optional frontend display.
+     */
+    @Column(name = "profile_type_detected", length = 30)
+    private String profileTypeDetected;
+
+    /**
+     * JD keywords that are completely absent from the resume with no
+     * injectable basis. Surfaced to the frontend after DONE as
+     * "Add these keywords manually to improve your ATS score further".
+     *
+     * Stored as a JSON string array: ["Kubernetes", "CI/CD", "Terraform"]
+     */
+    @Type(JsonBinaryType.class)
+    @Column(name = "ats_gap_keywords", columnDefinition = "jsonb")
+    private List<String> atsGapKeywords;
+
+    /**
+     * Per-bullet content improvement suggestions from the planner.
+     * Each entry: { section, bullet, suggestion }
+     * Stored for optional "Improve your resume" panel in the frontend.
+     *
+     * Non-blocking — never affects LaTeX compilation or job status.
+     */
+    @Type(JsonBinaryType.class)
+    @Column(name = "content_flags", columnDefinition = "jsonb")
+    private List<Map<String, String>> contentFlags;
+
+    // ── Old JSON-reshape pipeline fields (unchanged) ─────────────────────────
+
     @Type(JsonBinaryType.class)
     @Column(name = "parsed_resume", columnDefinition = "jsonb")
     private Map<String, Object> parsedResume;
@@ -70,7 +149,7 @@ public class ResumeJob {
     @Column(name = "ats_report", columnDefinition = "jsonb")
     private Map<String, Object> atsReport;
 
-    // ATS scores
+    // ATS scores (used by both pipelines)
     @Column(name = "ats_score_before")
     private Integer atsScoreBefore;
 

@@ -20,11 +20,15 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
 
+      # Mail
+      MAIL_USERNAME: ${MAIL_USERNAME}
+      MAIL_PASSWORD: ${MAIL_PASSWORD}
+
       # JWT – generate with: openssl rand -base64 64
       JWT_SECRET: ${JWT_SECRET}
 
       # Gemini
-      GEMINI_API_KEY: AIzaSyBWlpJkNUfQJcnGSXoFKC684Z68LHt-kGY
+      GEMINI_API_KEY: AIzaSyAJXZz8hvC-ZiW0VrxIfHGCs5biebNBdjo
 
       # AWS S3
       S3_BUCKET:          ${S3_BUCKET}
@@ -47,6 +51,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - tectonic_cache:/home/appuser/.cache/tectonic
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
@@ -90,6 +96,18 @@ services:
       retries: 5
     restart: unless-stopped
 
+
+  # ── Adminer (DB UI) ────────────────────────────────────────
+  adminer:
+    image: adminer
+    container_name: resume-shaper-adminer
+    ports:
+      - "8081:8080"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
+  tectonic_cache:

@@ -21,20 +21,39 @@ RUN java -Djarmode=layertools -jar target/*.jar extract --destination /app/layer
 # ─────────────────────────────────────────────────────────────
 FROM eclipse-temurin:21-jre-alpine AS runtime
 
-# Non-root user for security
+# ── Install Tectonic (musl binary — required for Alpine) ──────
+# Must run as root before we switch to appuser
+ARG TECTONIC_VERSION=0.15.0
+RUN apk add --no-cache curl \
+    && curl -fsSL \
+       "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%40${TECTONIC_VERSION}/tectonic-${TECTONIC_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+       | tar xz -C /usr/local/bin \
+    && chmod +x /usr/local/bin/tectonic \
+    && apk del curl \
+    && tectonic --version
+
+# ── Non-root user ─────────────────────────────────────────────
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Tectonic downloads LaTeX packages on first compile.
+# Give appuser a writable cache directory that persists in the container.
+RUN mkdir -p /home/appuser/.cache/tectonic \
+    && chown -R appuser:appgroup /home/appuser/.cache
+
 USER appuser
 
 WORKDIR /app
 
 # Copy layered JAR in optimal caching order
-# (dependencies change least frequently → copy first)
 COPY --from=builder /app/layers/dependencies/          ./
 COPY --from=builder /app/layers/spring-boot-loader/    ./
 COPY --from=builder /app/layers/snapshot-dependencies/ ./
 COPY --from=builder /app/layers/application/           ./
 
 EXPOSE 8080
+
+# Tell Tectonic where to store its package cache
+ENV XDG_CACHE_HOME=/home/appuser/.cache
 
 # JVM tuning for containers
 ENV JAVA_OPTS="\

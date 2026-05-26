@@ -36,6 +36,20 @@ spring:
       password: ${REDIS_PASSWORD:}
       timeout: 2000ms
 
+  # ── Mail (Gmail) ───────────────────────────────────────────
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: ${MAIL_USERNAME}
+    password: ${MAIL_PASSWORD}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+
   # ── File Upload ────────────────────────────────────────────
   servlet:
     multipart:
@@ -58,6 +72,7 @@ spring:
             client-secret: ${GITHUB_CLIENT_SECRET}
             scope: user:email
             redirect-uri: "{baseUrl}/api/auth/oauth2/callback/{registrationId}"
+
 
 # ── Server ─────────────────────────────────────────────────
 server:
@@ -93,7 +108,12 @@ app:
   # Gemini
   gemini:
     api-key: ${GEMINI_API_KEY}
-    model: gemini-2.5-flash
+    models:
+      - gemini-2.5-flash          # smartest — 20 RPD, first choice
+      - gemini-3.1-flash-lite     # 500 RPD — main workhorse
+      - gemma-4-31b-it            # ✅ confirmed exact ID — 1.5K RPD
+      - gemma-4-26b-a4b-it        # ✅ confirmed exact ID (was wrong before) — 1.5K RPD
+      - gemini-2.5-flash-lite     # last resort — 20 RPD
     base-url: https://generativelanguage.googleapis.com/v1beta
     timeout-seconds: 60
     max-output-tokens: 8192
@@ -107,14 +127,34 @@ app:
 
   # CORS
   cors:
-    allowed-origins: ${CORS_ORIGINS:http://localhost:3000,http://localhost:5173}
+    allowed-origins: ${CORS_ORIGINS:http://localhost:5173}
+
 
   # OAuth2 redirect after login
   oauth2:
-    redirect-uri: ${OAUTH2_REDIRECT_URI:http://localhost:3000/auth/callback}
+    redirect-uri: ${OAUTH2_REDIRECT_URI:http://localhost:5173/auth/callback}
 
   # ATS scoring weights
   ats:
     keyword-match-weight: 0.5
     section-completeness-weight: 0.3
     format-quality-weight: 0.2
+
+  # Mail sender identity
+  mail:
+    from: ${MAIL_USERNAME}
+    app-name: ResumeShapers
+
+  # OTP config
+  otp:
+    ttl-minutes: 5
+    attempts-ttl-minutes: 15
+    max-attempts: 5
+
+  #tectonic
+  latex:
+    tectonic:
+      path: ${app.latex.tectonic.path:tectonic}
+    compile:
+      timeout-seconds: ${app.latex.compile.timeout-seconds:60}    # kill runaway compile after 60s
+

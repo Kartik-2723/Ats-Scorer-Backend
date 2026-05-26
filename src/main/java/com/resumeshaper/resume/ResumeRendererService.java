@@ -2,7 +2,6 @@ package com.resumeshaper.resume;
 
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.xwpf.usermodel.*;
-import org.apache.xmlbeans.XmlCursor;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.*;
 import org.springframework.stereotype.Service;
 
@@ -14,16 +13,21 @@ import java.util.Map;
 
 /**
  * Converts the shaped resume JSON (from LLM) into a clean, ATS-safe DOCX.
- * Single page, no tables/graphics/headers, clean fonts.
+ *
+ * Changes from v1:
+ *  - Renders achievements[] section (between certifications and projects)
+ *  - Renders github from contact map
+ *  - Renders score field from education entries
+ *  - Renders link field from project entries
  */
 @Slf4j
 @Service
 public class ResumeRendererService {
 
-    private static final String FONT = "Calibri";
-    private static final int    BODY_SIZE = 20;     // half-points → 10pt
-    private static final int    H1_SIZE   = 28;     // 14pt
-    private static final int    H2_SIZE   = 22;     // 11pt
+    private static final String FONT         = "Calibri";
+    private static final int    BODY_SIZE    = 20;   // half-points → 10pt
+    private static final int    H1_SIZE      = 28;   // 14pt
+    private static final int    H2_SIZE      = 22;   // 11pt
     private static final String DIVIDER_COLOR = "2E74B5";
 
     @SuppressWarnings("unchecked")
@@ -39,14 +43,17 @@ public class ResumeRendererService {
             mar.setLeft(BigInteger.valueOf(900));
             mar.setRight(BigInteger.valueOf(900));
 
-            // ── Header: Name + Contact ────────────────────────
+            // ── Header: Name ──────────────────────────────────
             String name = str(shapedResume, "name");
             addHeading1(doc, name.toUpperCase());
 
+            // ── Contact line ──────────────────────────────────
             Object contactObj = shapedResume.get("contact");
-            if (contactObj instanceof Map<?,?> contact) {
+            if (contactObj instanceof Map<?, ?> contact) {
                 String contactLine = buildContactLine(contact);
-                addBodyPara(doc, contactLine, true, false);
+                if (!contactLine.isBlank()) {
+                    addBodyPara(doc, contactLine, true, false);
+                }
             }
 
             addDivider(doc);
@@ -82,14 +89,51 @@ public class ResumeRendererService {
                 }
             }
 
+            // ── Projects ──────────────────────────────────────
+            List<Map<String, Object>> projects = listOfMaps(shapedResume, "projects");
+            if (!projects.isEmpty()) {
+                addSection(doc, "PROJECTS");
+                for (Map<String, Object> p : projects) {
+                    String projectTitle = str(p, "name");
+                    String link = str(p, "link");
+                    String titleLine = link.isBlank()
+                            ? projectTitle
+                            : projectTitle + "  |  " + link;
+                    addJobHeader(doc, titleLine, "");
+                    addBodyPara(doc, str(p, "description"), false, true);
+                    List<String> tech = listOf(p, "tech");
+                    if (!tech.isEmpty()) {
+                        addBodyPara(doc, "Tech: " + String.join(", ", tech), false, true);
+                    }
+                    addSpacing(doc);
+                }
+            }
+
+            // ── Achievements ──────────────────────────────────
+            // KEY FIX: this section was missing entirely in v1
+            List<String> achievements = listOf(shapedResume, "achievements");
+            if (!achievements.isEmpty()) {
+                addSection(doc, "ACHIEVEMENTS");
+                for (String achievement : achievements) {
+                    addBullet(doc, achievement);
+                }
+                addSpacing(doc);
+            }
+
             // ── Education ─────────────────────────────────────
             List<Map<String, Object>> education = listOfMaps(shapedResume, "education");
             if (!education.isEmpty()) {
                 addSection(doc, "EDUCATION");
                 for (Map<String, Object> edu : education) {
-                    addJobHeader(doc,
-                            str(edu, "degree") + " — " + str(edu, "institution"),
-                            str(edu, "year"));
+                    String degreeInstitution = str(edu, "degree") + " — " + str(edu, "institution");
+                    String yearScore = str(edu, "year");
+                    String score = str(edu, "score");
+                    if (!score.isBlank()) {
+                        yearScore = yearScore.isBlank()
+                                ? score
+                                : yearScore + "  |  " + score;
+                    }
+                    addJobHeader(doc, degreeInstitution, yearScore);
                 }
                 addSpacing(doc);
             }
@@ -100,21 +144,6 @@ public class ResumeRendererService {
                 addSection(doc, "CERTIFICATIONS");
                 for (String cert : certs) addBullet(doc, cert);
                 addSpacing(doc);
-            }
-
-            // ── Projects ─────────────────────────────────────
-            List<Map<String, Object>> projects = listOfMaps(shapedResume, "projects");
-            if (!projects.isEmpty()) {
-                addSection(doc, "PROJECTS");
-                for (Map<String, Object> p : projects) {
-                    addJobHeader(doc, str(p, "name"), "");
-                    addBodyPara(doc, str(p, "description"), false, true);
-                    List<String> tech = listOf(p, "tech");
-                    if (!tech.isEmpty()) {
-                        addBodyPara(doc, "Tech: " + String.join(", ", tech), false, true);
-                    }
-                    addSpacing(doc);
-                }
             }
 
             doc.write(out);
@@ -178,7 +207,8 @@ public class ResumeRendererService {
         r.setFontSize(BODY_SIZE / 2);
     }
 
-    private void addBodyPara(XWPFDocument doc, String text, boolean center, boolean italic) {
+    private void addBodyPara(XWPFDocument doc, String text,
+                             boolean center, boolean italic) {
         XWPFParagraph p = doc.createParagraph();
         if (center) p.setAlignment(ParagraphAlignment.CENTER);
         XWPFRun r = p.createRun();
@@ -201,7 +231,7 @@ public class ResumeRendererService {
         p.setSpacingAfter(60);
     }
 
-    // ── Data helpers ─────────────────────────────────────────
+    // ── Data helpers ──────────────────────────────────────────
 
     private String str(Map<?, ?> map, String key) {
         Object v = map.get(key);
@@ -211,31 +241,29 @@ public class ResumeRendererService {
     @SuppressWarnings("unchecked")
     private List<String> listOf(Map<?, ?> map, String key) {
         Object v = map.get(key);
-        if (v instanceof List<?> list) {
-            return (List<String>) list;
-        }
+        if (v instanceof List<?> list) return (List<String>) list;
         return List.of();
     }
 
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> listOfMaps(Map<?, ?> map, String key) {
         Object v = map.get(key);
-        if (v instanceof List<?> list) {
-            return (List<Map<String, Object>>) list;
-        }
+        if (v instanceof List<?> list) return (List<Map<String, Object>>) list;
         return List.of();
     }
 
     private String buildContactLine(Map<?, ?> contact) {
         StringBuilder sb = new StringBuilder();
-        appendIfPresent(sb, contact, "email", " | ");
-        appendIfPresent(sb, contact, "phone", " | ");
+        appendIfPresent(sb, contact, "email",    " | ");
+        appendIfPresent(sb, contact, "phone",    " | ");
         appendIfPresent(sb, contact, "linkedin", " | ");
+        appendIfPresent(sb, contact, "github",   " | ");  // ← added
         appendIfPresent(sb, contact, "location", "");
         return sb.toString();
     }
 
-    private void appendIfPresent(StringBuilder sb, Map<?, ?> m, String key, String sep) {
+    private void appendIfPresent(StringBuilder sb, Map<?, ?> m,
+                                 String key, String sep) {
         Object v = m.get(key);
         if (v != null && !v.toString().isBlank()) {
             if (!sb.isEmpty()) sb.append(sep);

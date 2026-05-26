@@ -6,10 +6,12 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.scheduling.annotation.EnableAsync;
 import com.resumeshaper.config.AppProperties;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 @SpringBootApplication
 @EnableCaching
 @EnableAsync
+@EnableScheduling
 @EnableConfigurationProperties(AppProperties.class)
 public class ResumeShaperApplication {
 

@@ -9,7 +9,10 @@ import com.resumeshaper.user.User;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -25,26 +28,48 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ResumeJobService {
 
-    private final ResumeJobRepository        jobRepository;
-    private final ResumeVersionRepository    versionRepository;
-    private final ResumeParserService        parserService;
-    private final ResumeRendererService      rendererService;
-    private final S3FileStorageService       storage;
-    private final LLMOrchestrator            orchestrator;
-    private final GuestSessionService        guestSessionService;
+    private static final int MAX_RESUMES_PER_USER = 5;
+
+    private final ResumeJobRepository     jobRepository;
+    private final ResumeVersionRepository versionRepository;
+    private final ResumeParserService     parserService;
+    private final ResumeRendererService   rendererService;
+    private final S3FileStorageService    storage;
+    private final LLMOrchestrator         orchestrator;
+    private final GuestSessionService     guestSessionService;
 
     // ── Upload + kick off pipeline ────────────────────────────
 
     @Transactional
     public ResumeJob upload(MultipartFile file,
-                             ResumeDto.UploadRequest req,
-                             User authenticatedUser) throws IOException {
+                            ResumeDto.UploadRequest req,
+                            User authenticatedUser) throws IOException {
 
         // Validate file type
         String filename = file.getOriginalFilename();
         if (filename == null ||
-            (!filename.toLowerCase().endsWith(".pdf") && !filename.toLowerCase().endsWith(".docx"))) {
+                (!filename.toLowerCase().endsWith(".pdf") &&
+                        !filename.toLowerCase().endsWith(".docx"))) {
             throw new AppException("Only PDF and DOCX files are accepted", HttpStatus.BAD_REQUEST);
+        }
+
+        String guestToken = null;
+
+        if (authenticatedUser != null) {
+            // ── Priority 3: User resume limit check ──────────
+            long count = jobRepository.countByUserId(authenticatedUser.getId());
+            if (count >= MAX_RESUMES_PER_USER) {
+                throw new AppException(
+                        "Resume limit reached. Please delete an existing resume to upload a new one.",
+                        HttpStatus.CONFLICT);
+            }
+        } else {
+            // ── Priority 1: Guest cleanup on new upload ───────
+            guestToken = req.guestToken();
+            if (guestToken == null || !guestSessionService.exists(guestToken)) {
+                throw new AppException("Valid guest token required", HttpStatus.UNAUTHORIZED);
+            }
+            cleanupPreviousGuestJobs(guestToken);
         }
 
         // Upload original to S3
@@ -52,15 +77,6 @@ public class ResumeJobService {
 
         // Parse resume
         Map<String, Object> parsedResume = parserService.parse(file);
-
-        // Validate guest token (if guest)
-        String guestToken = null;
-        if (authenticatedUser == null) {
-            guestToken = req.guestToken();
-            if (guestToken == null || !guestSessionService.exists(guestToken)) {
-                throw new AppException("Valid guest token required", HttpStatus.UNAUTHORIZED);
-            }
-        }
 
         // Create job
         ResumeJob job = ResumeJob.builder()
@@ -84,6 +100,40 @@ public class ResumeJobService {
         return job;
     }
 
+    // ── Priority 1: Delete previous guest jobs + S3 files ────
+
+    private void cleanupPreviousGuestJobs(String guestToken) {
+        List<ResumeJob> previous = jobRepository.findAllByGuestToken(guestToken);
+        for (ResumeJob old : previous) {
+            if (old.getOriginalFileKey() != null) storage.delete(old.getOriginalFileKey());
+            if (old.getShapedFileKey()  != null) storage.delete(old.getShapedFileKey());
+            jobRepository.delete(old); // versions cascade
+            log.info("Cleaned up previous guest job={}", old.getId());
+        }
+    }
+
+    // ── Priority 4: Delete user resume ───────────────────────
+
+    @Transactional
+    public void deleteResume(UUID jobId, UUID userId) {
+        ResumeJob job = jobRepository.findByIdAndUserId(jobId, userId)
+                .orElseThrow(() -> new AppException("Job not found", HttpStatus.NOT_FOUND));
+
+        // Delete S3 files
+        if (job.getOriginalFileKey() != null) storage.delete(job.getOriginalFileKey());
+        if (job.getShapedFileKey()   != null) storage.delete(job.getShapedFileKey());
+
+        // Delete all version S3 files
+        versionRepository.findByJobIdOrderByVersionNumberDesc(jobId)
+                .forEach(v -> {
+                    if (v.getShapedFileKey() != null) storage.delete(v.getShapedFileKey());
+                });
+
+        // Delete DB row (versions cascade)
+        jobRepository.delete(job);
+        log.info("Deleted resume job={} for user={}", jobId, userId);
+    }
+
     // ── Status polling ────────────────────────────────────────
 
     @Transactional(readOnly = true)
@@ -97,6 +147,7 @@ public class ResumeJobService {
             case SCORING   -> "Calculating ATS score";
             case DONE      -> "Done!";
             case FAILED    -> "Processing failed";
+            default        -> "Unknown status";
         };
         return new ResumeDto.StatusResponse(job.getId(), job.getStatus(), step, job.getAtsScoreAfter());
     }
@@ -110,10 +161,12 @@ public class ResumeJobService {
         String downloadUrl = job.getShapedFileKey() != null
                 ? storage.presignedUrl(job.getShapedFileKey()) : null;
 
-        List<ResumeVersion> versions = versionRepository.findByJobIdOrderByVersionNumberDesc(jobId);
+        List<ResumeVersion> versions =
+                versionRepository.findByJobIdOrderByVersionNumberDesc(jobId);
         List<ResumeDto.VersionSummaryDto> versionDtos = versions.stream()
                 .map(v -> ResumeDto.VersionSummaryDto.from(v,
-                        v.getShapedFileKey() != null ? storage.presignedUrl(v.getShapedFileKey()) : null))
+                        v.getShapedFileKey() != null
+                                ? storage.presignedUrl(v.getShapedFileKey()) : null))
                 .toList();
 
         return ResumeDto.ResumeJobDetailDto.from(job, downloadUrl, versionDtos);
@@ -133,13 +186,18 @@ public class ResumeJobService {
         // Save previous version
         saveVersion(job);
 
+        // Priority 6: Delete old shaped S3 file before creating new one
+        if (job.getShapedFileKey() != null) {
+            storage.delete(job.getShapedFileKey());
+        }
+
         // Apply edits
         job.setShapedResume(req.shapedResume());
         job.setStatus(JobStatus.SCORING);
 
         // Re-generate DOCX + upload
         byte[] docx = rendererService.render(req.shapedResume());
-        String key  = storage.uploadBytes(docx,
+        String key = storage.uploadBytes(docx,
                 "shaped/" + jobId + "/v" + versionRepository.countByJobId(jobId) + ".docx",
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
         job.setShapedFileKey(key);
@@ -154,6 +212,13 @@ public class ResumeJobService {
     public ResumeJob reshape(UUID jobId, String guestToken, User user) {
         ResumeJob job = findJob(jobId, guestToken, user);
         saveVersion(job);
+
+        // Priority 6: Delete old shaped S3 file before reshaping
+        if (job.getShapedFileKey() != null) {
+            storage.delete(job.getShapedFileKey());
+            job.setShapedFileKey(null);
+        }
+
         job.setStatus(JobStatus.PENDING);
         job = jobRepository.save(job);
         orchestrator.runPipeline(job);
@@ -174,8 +239,19 @@ public class ResumeJobService {
 
     @Transactional(readOnly = true)
     public Page<ResumeDto.ResumeJobSummaryDto> findByUser(UUID userId, String search,
-                                                           Boolean starred, Pageable pageable) {
-        return jobRepository.findByUserId(userId, search, starred, pageable)
+                                                          Boolean starred, Pageable pageable) {
+        Specification<ResumeJob> spec = Specification
+                .where(ResumeJobSpec.forUser(userId))
+                .and(ResumeJobSpec.roleContains(search))
+                .and(ResumeJobSpec.isStarred(starred));
+
+        Pageable sortedPageable = PageRequest.of(
+                pageable.getPageNumber(),
+                pageable.getPageSize(),
+                Sort.by("createdAt").descending()
+        );
+
+        return jobRepository.findAll(spec, sortedPageable)
                 .map(ResumeDto.ResumeJobSummaryDto::from);
     }
 

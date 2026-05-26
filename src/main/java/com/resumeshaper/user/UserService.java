@@ -46,16 +46,42 @@ public class UserService implements UserDetailsService {
         return userRepository
                 .findByProviderAndProviderId(provider, providerId)
                 .map(existing -> {
-                    // Update profile fields that may have changed
                     existing.setName(name);
                     existing.setAvatarUrl(avatar);
                     if (email != null) existing.setEmail(email);
                     return userRepository.save(existing);
                 })
                 .orElseGet(() -> {
-                    log.info("Creating new user email={} provider={}", email, provider);
+                    // Check if email already exists (e.g. signed up via OTP or other OAuth)
+                    if (email != null) {
+                        return userRepository.findByEmail(email)
+                                .map(existingUser -> {
+                                    // Link this OAuth provider to the existing account
+                                    log.info("Linking provider={} to existing user email={}",
+                                            provider, email);
+                                    existingUser.setProvider(provider);
+                                    existingUser.setProviderId(providerId);
+                                    existingUser.setName(name != null ? name : existingUser.getName());
+                                    existingUser.setAvatarUrl(avatar != null ? avatar : existingUser.getAvatarUrl());
+                                    return userRepository.save(existingUser);
+                                })
+                                .orElseGet(() -> {
+                                    log.info("Creating new user email={} provider={}", email, provider);
+                                    return userRepository.save(User.builder()
+                                            .email(email)
+                                            .name(name)
+                                            .avatarUrl(avatar)
+                                            .provider(provider)
+                                            .providerId(providerId)
+                                            .role(UserRole.USER)
+                                            .build());
+                                });
+                    }
+
+                    // No email from provider (rare GitHub case)
+                    log.info("Creating new user providerId={} provider={}", providerId, provider);
                     return userRepository.save(User.builder()
-                            .email(email != null ? email : providerId + "@" + provider.toLowerCase() + ".oauth")
+                            .email(providerId + "@" + provider.toLowerCase() + ".oauth")
                             .name(name)
                             .avatarUrl(avatar)
                             .provider(provider)
@@ -71,6 +97,35 @@ public class UserService implements UserDetailsService {
     public User findById(UUID id) {
         return userRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("User", id.toString()));
+    }
+
+    // ── Email / OTP ──────────────────────────────────────────
+
+    @Transactional
+    public User findOrCreateEmailUser(String email) {
+        String normalizedEmail = email.toLowerCase().trim();
+
+        return userRepository.findByEmail(normalizedEmail)
+                .map(existing -> {
+                    // If they previously signed up via OAuth, block collision
+                    if (!"EMAIL".equals(existing.getProvider())) {
+                        throw new IllegalStateException(
+                                "This email is linked to a " + existing.getProvider()
+                                        + " account. Please sign in with "
+                                        + existing.getProvider() + " instead."
+                        );
+                    }
+                    return existing;
+                })
+                .orElseGet(() -> {
+                    log.info("Creating new EMAIL user: {}", normalizedEmail);
+                    return userRepository.save(User.builder()
+                            .email(normalizedEmail)
+                            .provider("EMAIL")
+                            .providerId(null)
+                            .role(UserRole.USER)
+                            .build());
+                });
     }
 
     // ── Private helpers ──────────────────────────────────────
