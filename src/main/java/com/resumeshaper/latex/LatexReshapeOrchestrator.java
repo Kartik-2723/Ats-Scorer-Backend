@@ -1,6 +1,8 @@
 package com.resumeshaper.latex;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.resumeshaper.ats.ATSReport;
+import com.resumeshaper.ats.ATSScoreService;
 import com.resumeshaper.common.exception.AppException;
 import com.resumeshaper.common.exception.GeminiQuotaExhaustedException;
 import com.resumeshaper.llm.GeminiApiClient;
@@ -13,51 +15,24 @@ import com.resumeshaper.storage.S3FileStorageService;
 import com.resumeshaper.user.User;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.springframework.context.ApplicationContext;
 import org.springframework.http.HttpStatus;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.multipart.MultipartFile;
+import org.apache.pdfbox.Loader;
 
 import java.io.IOException;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
-/**
- * Async pipeline for the LaTeX reshape feature.
- *
- * ── Pipeline stages ──────────────────────────────────────────────────────────
- *   PDF:   PENDING → CONVERTING → RESHAPING_LATEX → COMPILING → DONE
- *   LaTeX: PENDING → RESHAPING_LATEX → COMPILING → DONE
- *
- * ── Two-phase reshape (both happen inside RESHAPING_LATEX) ───────────────────
- *   Phase 1 — PLANNING:
- *     Planner LLM call reads the raw resume and returns a structured ResumePlan:
- *       - profileType (STUDENT_FRESHER / EARLY_CAREER / MID_SENIOR / CAREER_SWITCHER)
- *       - discoveredSections (every section found — none may be dropped)
- *       - rankedSections (reordered by ATS impact for the given role + profileType)
- *       - mustBoldKeywords, injectableKeywords, atsGapKeywords, contentFlags
- *
- *   Phase 2 — RESHAPE:
- *     Reshape LLM call receives the plan explicitly.
- *     Section order, bold keywords, injectable keywords all come from the plan.
- *     No hardcoded section ordering anywhere.
- *
- * ── Compile retry loop (max 3 attempts) ──────────────────────────────────────
- *   Attempt 1 — initial compile
- *   Attempt 2 — standard LLM fix (fix syntax only, preserve everything)
- *   Attempt 3 — aggressive LLM fix (simplify constructs if needed, still preserve content)
- *   Both fix prompts are plan-aware: section order and preservation enforced.
- *
- * ── ATS scoring ──────────────────────────────────────────────────────────────
- *   Runs as a separate fire-and-forget call AFTER successful compile.
- *   Never blocks the critical path.
- *
- * ── Plan persistence ─────────────────────────────────────────────────────────
- *   profileTypeDetected, atsGapKeywords, contentFlags saved to ResumeJob
- *   so the frontend can surface them as improvement suggestions after DONE.
- */
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -73,9 +48,18 @@ public class LatexReshapeOrchestrator {
     private final S3FileStorageService storage;
     private final GuestSessionService  guestSessionService;
     private final ObjectMapper         objectMapper;
+    private final ATSScoreService      atsScoreService;
+    private final ApplicationContext   applicationContext;
+
+    private static final List<JobStatus> ACTIVE_STATUSES = List.of(
+            JobStatus.PENDING, JobStatus.CONVERTING,
+            JobStatus.RESHAPING_LATEX, JobStatus.COMPILING,
+            JobStatus.FIX_RETRY, JobStatus.FITTING_PAGE
+    );
+    private static final int IDEMPOTENCY_WINDOW_MINUTES = 30;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Entry point (synchronous)
+    // Entry point
     // ─────────────────────────────────────────────────────────────────────────
 
     @Transactional
@@ -84,9 +68,19 @@ public class LatexReshapeOrchestrator {
                             LatexReshapeRequest req,
                             User user) throws IOException {
 
+        OffsetDateTime since = OffsetDateTime.now().minusMinutes(IDEMPOTENCY_WINDOW_MINUTES);
+
+        boolean alreadyRunning = (user == null)
+                ? jobRepository.hasActiveGuestJob(req.getGuestToken(), ACTIVE_STATUSES, since)
+                : jobRepository.hasActiveUserJob(user.getId(), ACTIVE_STATUSES, since);
+
+        if (alreadyRunning) {
+            throw new AppException("A job is already in progress", HttpStatus.CONFLICT);
+        }
+
         String s3Key = storage.uploadBytes(
                 file.getBytes(),
-                "originals/" + java.util.UUID.randomUUID() + "/" + file.getOriginalFilename(),
+                "originals/" + UUID.randomUUID() + "/" + file.getOriginalFilename(),
                 file.getContentType() != null ? file.getContentType() : "application/octet-stream"
         );
 
@@ -110,8 +104,17 @@ public class LatexReshapeOrchestrator {
 
         job = jobRepository.save(job);
 
-        byte[] fileBytes = file.getBytes();
-        runPipeline(job.getId(), fileBytes, inputType, req);
+        final UUID jobId     = job.getId();
+        final byte[] fileBytes = file.getBytes();
+        final LatexReshapeOrchestrator self =
+                applicationContext.getBean(LatexReshapeOrchestrator.class);
+
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                self.runPipeline(jobId, fileBytes, inputType, req);
+            }
+        });
 
         return job;
     }
@@ -121,7 +124,7 @@ public class LatexReshapeOrchestrator {
     // ─────────────────────────────────────────────────────────────────────────
 
     @Async("llmExecutor")
-    public void runPipeline(java.util.UUID jobId,
+    public void runPipeline(UUID jobId,
                             byte[] fileBytes,
                             InputType inputType,
                             LatexReshapeRequest req) {
@@ -133,11 +136,11 @@ public class LatexReshapeOrchestrator {
 
         try {
             String rawLatex;
-            String extractedText = null;  // kept for ATS scoring after compile
+            String extractedText = null;
 
             updateStatus(job, JobStatus.RESHAPING_LATEX);
 
-            // ── Stage 1: Extract text (PDF only) ──────────────────────────────
+            // ── Stage 1: Extract text (PDF only) ─────────────────────────────
             if (inputType == InputType.PDF) {
                 updateStatus(job, JobStatus.CONVERTING);
                 extractedText = pdfExtractor.extract(fileBytes);
@@ -145,53 +148,43 @@ public class LatexReshapeOrchestrator {
                 updateStatus(job, JobStatus.RESHAPING_LATEX);
             }
 
-            // ── Stage 2: Phase 1 — Plan ───────────────────────────────────────
-            // Planner reads the raw resume and produces a structured ResumePlan.
-            // This determines section order, keywords, and profile type.
-            // Runs silently inside RESHAPING_LATEX — no new JobStatus needed.
+            // ── Stage 2: Plan ─────────────────────────────────────────────────
             String textForPlanner = (inputType == InputType.PDF)
-                    ? extractedText
-                    : job.getRawLatex();
+                    ? extractedText : job.getRawLatex();
 
             log.info("job={} Phase 1: running planner", jobId);
             ResumePlan plan = runPlanner(jobId, textForPlanner, req);
 
-            // Persist plan metadata to DB immediately — frontend can use after DONE
             savePlanMetadata(job, plan);
-            log.info("job={} Plan complete: profileType={} sections={} boldKeywords={} injectKeywords={}",
-                    jobId,
-                    plan.getProfileType(),
-                    plan.getRankedSections(),
-                    plan.getMustBoldKeywords(),
-                    plan.getInjectableKeywords());
+            log.info("job={} Plan: profileType={} sections={} bold={} inject={} gaps={}",
+                    jobId, plan.getProfileType(), plan.getRankedSections(),
+                    plan.getMustBoldKeywords(), plan.getInjectableKeywords(),
+                    plan.getAtsGapKeywords());
 
-            // ── Stage 3: Phase 2 — Reshape using plan ────────────────────────
-            log.info("job={} Phase 2: reshaping with plan", jobId);
+            String originalTextForScoring = textForPlanner;
+            scoreOriginalRulesBased(job, originalTextForScoring, plan);
 
-            if (inputType == InputType.PDF) {
-                Map<String, Object> llmResult = gemini.generateJson(
-                        latexPrompts.latexSystemInstruction(),
-                        latexPrompts.pdfToLatexReshapePrompt(
-                                extractedText, plan, req.getRoleLabel(), req.getJdText())
-                );
-                rawLatex = extractLatex(llmResult);
-                saveRawLatex(job, rawLatex);
-                saveChangesLog(job, llmResult);
+            // ── Stage 3a: Content rewrite ─────────────────────────────────────
+            log.info("job={} Phase 2a: content rewrite", jobId);
+            Map<String, Object> contentResult = gemini.generateJson(
+                    latexPrompts.contentRewriteSystemInstruction(),
+                    latexPrompts.contentRewritePrompt(
+                            textForPlanner, plan, req.getRoleLabel(), req.getJdText())
+            );
+            saveChangesLog(job, contentResult);
 
-            } else {
-                Map<String, Object> llmResult = gemini.generateJson(
-                        latexPrompts.latexSystemInstruction(),
-                        latexPrompts.latexReshapePrompt(
-                                job.getRawLatex(), plan, req.getRoleLabel(), req.getJdText())
-                );
-                rawLatex = extractLatex(llmResult);
-                saveChangesLog(job, llmResult);
-            }
+            String structuredContentJson = objectMapper.writeValueAsString(contentResult);
+
+            // ── Stage 3b: LaTeX generation ────────────────────────────────────
+            log.info("job={} Phase 2b: LaTeX generation", jobId);
+            rawLatex = gemini.generateLatex(
+                    latexPrompts.latexSystemInstruction(),
+                    latexPrompts.latexGeneratePrompt(
+                            structuredContentJson, plan, req.getRoleLabel())
+            );
+            saveRawLatex(job, rawLatex);
 
             // ── Stage 4: Compile loop (max 3 attempts) ────────────────────────
-            // Attempt 1 — initial compile
-            // Attempt 2 — standard fix (syntax only, plan-aware)
-            // Attempt 3 — aggressive fix (simplify constructs, plan-aware)
             String latexToCompile = rawLatex;
             byte[] compiledPdf    = null;
 
@@ -215,27 +208,24 @@ public class LatexReshapeOrchestrator {
                                 ex.getCompilerLog());
                     }
 
-                    // Pass attempt number so prompt builder can escalate strategy:
-                    // attempt=2 → standard fix (fix syntax only)
-                    // attempt=3 → aggressive fix (simplify constructs if needed)
                     int fixAttempt = attempt + 1;
                     log.info("job={} sending to LLM for fix (fixAttempt={})", jobId, fixAttempt);
-
                     Map<String, Object> fixResult = gemini.generateJson(
                             latexPrompts.latexSystemInstruction(),
                             latexPrompts.latexFixPrompt(
-                                    latexToCompile,
-                                    ex.getCompilerLog(),
-                                    plan,         // plan enforces section preservation during fix
-                                    fixAttempt    // drives standard vs aggressive strategy
-                            )
+                                    latexToCompile, ex.getCompilerLog(), plan, fixAttempt)
                     );
                     latexToCompile = extractLatexFix(fixResult);
                 }
             }
 
+            // ── Stage 7: Fit to 1 page ────────────────────────────────────────
+            updateStatus(job, JobStatus.FITTING_PAGE);
+            FitPageResult fitResult = fitToOnePage(jobId, latexToCompile, compiledPdf, plan);
+            latexToCompile = fitResult.latex();
+            compiledPdf    = fitResult.pdf();
+
             // ── Stage 5: Upload compiled PDF ──────────────────────────────────
-            updateStatus(job, JobStatus.COMPILING);
             String pdfKey = storage.uploadBytes(
                     compiledPdf,
                     "compiled/" + jobId + "/resume.pdf",
@@ -246,14 +236,14 @@ public class LatexReshapeOrchestrator {
             log.info("LaTeX reshape pipeline DONE: job={} profileType={} attempts={}",
                     jobId, plan.getProfileType(), job.getLatexCompileAttempts());
 
-            // ── Stage 6: ATS scoring (non-blocking, best-effort) ──────────────
-            // Fires after DONE so it never delays the user seeing their result.
-            final String finalLatex     = latexToCompile;
-            final String finalExtracted = extractedText;
-            scoreAsync(job.getId(),
-                    finalExtracted != null ? finalExtracted : job.getRawLatex(),
-                    finalLatex,
-                    req.getRoleLabel());
+            // ── Stage 6: Async ATS score ──────────────────────────────────────
+            final UUID   finalJobId       = job.getId();
+            final String finalOriginalText = originalTextForScoring;
+            final String finalLatexCopy    = latexToCompile;
+            final String finalRole         = req.getRoleLabel();
+
+            applicationContext.getBean(LatexReshapeOrchestrator.class)
+                    .scoreAsync(finalJobId, finalOriginalText, finalLatexCopy, finalRole);
 
         } catch (GeminiQuotaExhaustedException ex) {
             log.warn("All Gemini models quota-exhausted for job={}", jobId);
@@ -271,19 +261,94 @@ public class LatexReshapeOrchestrator {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Stage 7 — Fit to 1 page (non-fatal, 3-tier)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private FitPageResult fitToOnePage(UUID jobId,
+                                       String latex,
+                                       byte[] pdf,
+                                       ResumePlan plan) {
+        int pages = countPdfPages(pdf);
+        log.info("job={} fit-page: detected {} page(s)", jobId, pages);
+
+        if (pages == 1) {
+            log.info("job={} fit-page: already 1 page — skipping", jobId);
+            return new FitPageResult(latex, pdf);
+        }
+
+        // Tier 1: spacing expand — only if somehow 0 pages detected (defensive)
+        // In practice pages > 1 means we go straight to Tier 2
+
+        // Tier 2: sizing compress
+        try {
+            log.info("job={} fit-page Tier 2: sizing compress ({} pages)", jobId, pages);
+            String compressedLatex = gemini.generateLatex(
+                    latexPrompts.latexSystemInstruction(),
+                    latexPrompts.sizingCompressPrompt(latex, pages)
+            );
+            byte[] compressedPdf = compiler.compile(compressedLatex);
+            int newPages = countPdfPages(compressedPdf);
+
+            if (newPages == 1) {
+                log.info("job={} fit-page Tier 2 SUCCESS: now 1 page", jobId);
+                return new FitPageResult(compressedLatex, compressedPdf);
+            }
+
+            log.info("job={} fit-page Tier 2 insufficient ({} pages) — escalating to Tier 3",
+                    jobId, newPages);
+            // Use compressed as base for Tier 3
+            latex = compressedLatex;
+            pages = newPages;
+
+        } catch (LatexCompileException ex) {
+            log.warn("job={} fit-page Tier 2 compile failed — escalating to Tier 3: {}",
+                    jobId, ex.getMessage());
+        } catch (Exception ex) {
+            log.warn("job={} fit-page Tier 2 LLM failed — escalating to Tier 3: {}",
+                    jobId, ex.getMessage());
+        }
+
+        // Tier 3: content trim — last resort
+        try {
+            log.info("job={} fit-page Tier 3: content trim ({} pages)", jobId, pages);
+            String trimmedLatex = gemini.generateLatex(
+                    latexPrompts.latexSystemInstruction(),
+                    latexPrompts.contentTrimPrompt(latex, pages)
+            );
+            byte[] trimmedPdf = compiler.compile(trimmedLatex);
+            int newPages = countPdfPages(trimmedPdf);
+            log.info("job={} fit-page Tier 3 result: {} page(s)", jobId, newPages);
+            return new FitPageResult(trimmedLatex, trimmedPdf);
+
+        } catch (LatexCompileException ex) {
+            log.warn("job={} fit-page Tier 3 compile failed — returning best available result: {}",
+                    jobId, ex.getMessage());
+        } catch (Exception ex) {
+            log.warn("job={} fit-page Tier 3 LLM failed — returning best available result: {}",
+                    jobId, ex.getMessage());
+        }
+
+        // All tiers failed — return whatever we had going in (non-fatal)
+        log.warn("job={} fit-page: all tiers exhausted — using pre-fit result", jobId);
+        return new FitPageResult(latex, pdf);
+    }
+
+    private int countPdfPages(byte[] pdfBytes) {
+        try (PDDocument doc = Loader.loadPDF(pdfBytes)) {
+            return doc.getNumberOfPages();
+        } catch (Exception e) {
+            log.warn("Page count detection failed — assuming 1 page: {}", e.getMessage());
+            return 1;
+        }
+    }
+
+    private record FitPageResult(String latex, byte[] pdf) {}
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Phase 1 — Planner
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Runs the planner LLM call and parses the result into a ResumePlan.
-     *
-     * Falls back to a safe default plan if:
-     *   - The LLM returns malformed JSON
-     *   - Required fields are missing
-     * This ensures the reshape phase always has a valid plan and never crashes
-     * due to a planner failure.
-     */
-    private ResumePlan runPlanner(java.util.UUID jobId,
+    private ResumePlan runPlanner(UUID jobId,
                                   String resumeText,
                                   LatexReshapeRequest req) {
         try {
@@ -297,7 +362,6 @@ public class LatexReshapeOrchestrator {
                     )
             );
             return parsePlan(raw);
-
         } catch (Exception ex) {
             log.warn("job={} Planner LLM call failed — using safe default plan: {}",
                     jobId, ex.getMessage());
@@ -305,10 +369,6 @@ public class LatexReshapeOrchestrator {
         }
     }
 
-    /**
-     * Parses the raw LLM map into a typed ResumePlan.
-     * Each field is extracted defensively — missing fields fall back to empty lists.
-     */
     @SuppressWarnings("unchecked")
     private ResumePlan parsePlan(Map<String, Object> raw) {
         String profileType = raw.getOrDefault("profileType", "STUDENT_FRESHER").toString();
@@ -319,7 +379,6 @@ public class LatexReshapeOrchestrator {
         List<String> injectable         = toStringList(raw.get("injectableKeywords"));
         List<String> atsGap             = toStringList(raw.get("atsGapKeywords"));
 
-        // Parse contentFlags — array of {section, bullet, suggestion} objects
         List<ResumePlan.ContentFlag> flags = new ArrayList<>();
         Object rawFlags = raw.get("contentFlags");
         if (rawFlags instanceof List<?> flagList) {
@@ -334,7 +393,6 @@ public class LatexReshapeOrchestrator {
             }
         }
 
-        // Guard: if rankedSections is empty or mismatched, fall back to discoveredSections
         if (rankedSections.isEmpty()) {
             rankedSections = new ArrayList<>(discoveredSections);
         }
@@ -350,11 +408,6 @@ public class LatexReshapeOrchestrator {
                 .build();
     }
 
-    /**
-     * Safe default plan used when the planner LLM call fails.
-     * Empty sections list means the reshape prompt will use its own judgment —
-     * still better than crashing the entire pipeline.
-     */
     private ResumePlan buildDefaultPlan() {
         return ResumePlan.builder()
                 .profileType("STUDENT_FRESHER")
@@ -368,11 +421,54 @@ public class LatexReshapeOrchestrator {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // ATS score — async, best-effort, never blocks pipeline
+    // Rules-based ATS score (synchronous)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Transactional
+    protected void scoreOriginalRulesBased(ResumeJob job,
+                                           String originalText,
+                                           ResumePlan plan) {
+        try {
+            List<String> allJdKeywords = new ArrayList<>();
+            if (plan.getMustBoldKeywords()   != null) allJdKeywords.addAll(plan.getMustBoldKeywords());
+            if (plan.getInjectableKeywords() != null) allJdKeywords.addAll(plan.getInjectableKeywords());
+            if (plan.getAtsGapKeywords()     != null) allJdKeywords.addAll(plan.getAtsGapKeywords());
+
+            String plainText = originalText.contains("\\documentclass")
+                    ? ATSScoreService.stripLatex(originalText)
+                    : originalText;
+
+            ATSReport report = atsScoreService.score(plainText, allJdKeywords);
+
+            job.setAtsScoreBefore(report.getOverallScore());
+            job.setAtsReport(Map.of(
+                    "overallScore",    report.getOverallScore(),
+                    "keywordScore",    report.getKeywordScore(),
+                    "sectionScore",    report.getSectionScore(),
+                    "formatScore",     report.getFormatScore(),
+                    "verbScore",       report.getVerbScore(),
+                    "matchedKeywords", report.getMatchedKeywords(),
+                    "missingKeywords", report.getMissingKeywords(),
+                    "presentSections", report.getPresentSections(),
+                    "formatIssues",    report.getFormatIssues()
+            ));
+
+            jobRepository.save(job);
+            log.info("job={} atsScoreBefore={} (rules-based, {} keywords checked)",
+                    job.getId(), report.getOverallScore(), allJdKeywords.size());
+
+        } catch (Exception ex) {
+            log.warn("job={} rules-based ATS scoring failed (non-fatal): {}",
+                    job.getId(), ex.getMessage());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // LLM ATS score (async)
     // ─────────────────────────────────────────────────────────────────────────
 
     @Async("llmExecutor")
-    public void scoreAsync(java.util.UUID jobId,
+    public void scoreAsync(UUID jobId,
                            String originalText,
                            String shapedLatex,
                            String roleLabel) {
@@ -385,15 +481,14 @@ public class LatexReshapeOrchestrator {
             ResumeJob job = jobRepository.findById(jobId).orElse(null);
             if (job == null) return;
 
-            Object before = scores.get("atsScoreBefore");
-            Object after  = scores.get("atsScoreAfter");
-            if (before instanceof Number n) job.setAtsScoreBefore(n.intValue());
-            if (after  instanceof Number n) job.setAtsScoreAfter(n.intValue());
+            Object after = scores.get("atsScoreAfter");
+            if (after instanceof Number n) job.setAtsScoreAfter(n.intValue());
+
             jobRepository.save(job);
-            log.debug("job={} ATS scores saved: before={} after={}", jobId, before, after);
+            log.debug("job={} atsScoreAfter={} (LLM adversarial)", jobId, job.getAtsScoreAfter());
 
         } catch (Exception ex) {
-            log.warn("job={} ATS scoring failed (non-fatal): {}", jobId, ex.getMessage());
+            log.warn("job={} LLM ATS scoring failed (non-fatal): {}", jobId, ex.getMessage());
         }
     }
 
@@ -422,21 +517,14 @@ public class LatexReshapeOrchestrator {
         }
     }
 
-    /**
-     * Persists plan metadata to ResumeJob immediately after planning completes.
-     * atsGapKeywords and contentFlags are surfaced to the frontend after DONE
-     * as "manual improvement suggestions".
-     */
     @Transactional
     protected void savePlanMetadata(ResumeJob job, ResumePlan plan) {
         job.setProfileTypeDetected(plan.getProfileType());
 
-        // Store atsGapKeywords as JSON array in the existing jsonb column
         if (plan.getAtsGapKeywords() != null && !plan.getAtsGapKeywords().isEmpty()) {
             job.setAtsGapKeywords(plan.getAtsGapKeywords());
         }
 
-        // Store contentFlags as structured JSON for frontend display
         if (plan.getContentFlags() != null && !plan.getContentFlags().isEmpty()) {
             List<Map<String, String>> flags = plan.getContentFlags().stream()
                     .map(f -> Map.of(
@@ -476,23 +564,6 @@ public class LatexReshapeOrchestrator {
     // LLM response helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Extracts LaTeX from main reshape response.
-     * Checks "shapedLatex" only — the main prompts always use this key.
-     */
-    private String extractLatex(Map<String, Object> result) {
-        Object val = result.get("shapedLatex");
-        if (val instanceof String s && !s.isBlank()) return s;
-        throw new AppException(
-                "LLM did not return a 'shapedLatex' field in response",
-                HttpStatus.INTERNAL_SERVER_ERROR);
-    }
-
-    /**
-     * Extracts LaTeX from fix response.
-     * Checks "fixedLatex" first (correct key), then "shapedLatex" as fallback
-     * in case the model drifts back to the system instruction schema.
-     */
     private String extractLatexFix(Map<String, Object> result) {
         Object fixed = result.get("fixedLatex");
         if (fixed instanceof String s && !s.isBlank()) return s;

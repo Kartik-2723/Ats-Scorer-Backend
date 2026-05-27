@@ -12,11 +12,6 @@ public class LatexPromptBuilder {
     // PHASE 1 — Planner
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * System instruction for the planner call.
-     * Purely analytical — no LaTeX rules, no compilation constraints.
-     * Kept separate from latexSystemInstruction() intentionally.
-     */
     public String plannerSystemInstruction() {
         return """
                 You are an expert resume strategist and ATS optimization specialist.
@@ -84,6 +79,7 @@ public class LatexPromptBuilder {
                                      existing resume content logically implies the skill
                                      (e.g. candidate uses Docker → "containerization" injectable)
                                      NEVER inject if no basis exists in resume
+                                     MAXIMUM 5 injectable keywords — be selective, not exhaustive
                 atsGapKeywords     — in JD, absent from resume, NOT injectable
                                      (no existing basis) → surface to user as manual suggestions
 
@@ -96,10 +92,6 @@ public class LatexPromptBuilder {
                 """;
     }
 
-    /**
-     * Planner prompt — Phase 1 of the pipeline.
-     * Returns structured JSON plan, no LaTeX.
-     */
     public String resumePlannerPrompt(String extractedText,
                                       String roleLabel,
                                       String roleCategory,
@@ -146,17 +138,131 @@ public class LatexPromptBuilder {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // PHASE 2 — LaTeX system instruction (execution only, no ordering decisions)
+    // PHASE 2a — Content Rewriter
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * System instruction for the reshape call.
-     * Section order is provided dynamically in each prompt — NOT hardcoded here.
-     * This instruction handles ONLY compilation safety and formatting rules.
-     */
+    public String contentRewriteSystemInstruction() {
+        return """
+                You are an expert resume writer and ATS optimization specialist.
+                Your job is to REWRITE resume content into a clean structured format.
+
+                You do NOT write LaTeX. You do NOT add any markup or formatting codes.
+                You ONLY improve wording, inject keywords, strengthen bullets, and
+                produce structured plain-text JSON that a LaTeX generator will format.
+
+                ══ REWRITE RULES ══
+                1. Every bullet must start with a strong action verb
+                   (Built, Engineered, Designed, Led, Optimised, Deployed, Developed, etc.)
+                2. Add or preserve metrics wherever they exist in the original
+                3. Keep ALL content — remove nothing, add no new bullet points
+                4. Inject injectable keywords naturally into EXISTING bullets only
+                   - Max 2 occurrences per injectable keyword across the entire document
+                   - Only inject if the bullet already implies the skill
+                   - If injection makes a bullet sound like a keyword list, skip it
+                5. Do NOT use LaTeX syntax, HTML, markdown, or any special markup
+                6. Preserve exact section names from the discovered sections list
+                7. For entries with multiple sub-items (e.g. job roles, projects):
+                   - "heading" = the title line (role, company, dates OR project name, tech, dates)
+                   - "bullets" = the bullet points under that heading
+
+                ══ CAREER SWITCHER RULE ══
+                If profileType is CAREER_SWITCHER:
+                - Lead every bullet with the transferable skill or outcome
+                - De-emphasise industry-specific jargon that won't land for the target role
+                - Reframe experience toward where the candidate is going, not where they came from
+                """;
+    }
+
+    public String contentRewritePrompt(String resumeText,
+                                       ResumePlan plan,
+                                       String roleLabel,
+                                       String jdText) {
+        String effectiveJD = buildEffectiveJD(roleLabel, jdText);
+        String careerBlock = buildCareerSwitcherBlock(plan.getProfileType(), roleLabel);
+
+        return """
+                Rewrite the resume content for the role: "%s"
+                Profile type: %s
+
+                %s
+
+                ══ RESUME TEXT ══
+                (Lines prefixed [HEADING] = section titles, [BOLD] = important labels,
+                 [BULLET] = bullet points. Plain lines = body text.)
+
+                %s
+
+                ══ TARGET JOB DESCRIPTION ══
+                %s
+
+                ══ SECTION ORDER — USE THIS EXACT ORDER IN YOUR OUTPUT ══
+                %s
+
+                ══ KEYWORD INJECTION RULES ══
+                Inject these into existing bullets naturally (max 2x each across document):
+                Injectable keywords: %s
+
+                These keywords already appear in the resume — ensure they are present
+                in the relevant bullets (do NOT add new bullets to include them):
+                Existing keywords to preserve: %s
+
+                ══ YOUR TASK ══
+                1. Rewrite every bullet: action verb + what was built/done + outcome/metric
+                2. Inject injectable keywords naturally — quality over keyword density
+                3. Preserve ALL original content — facts, dates, names, metrics, education
+                4. Use section names EXACTLY as listed in the section order above
+                5. Output sections in the EXACT order listed above
+
+                ══ OUTPUT FORMAT ══
+                Return ONLY this JSON — no markdown fences, no LaTeX, no extra fields:
+                {
+                  "header": {
+                    "name": "Candidate Full Name",
+                    "email": "email@example.com",
+                    "phone": "+91-XXXXXXXXXX",
+                    "links": ["linkedin.com/in/handle", "github.com/handle"]
+                  },
+                  "sections": [
+                    {
+                      "title": "exact section name as discovered",
+                      "entries": [
+                        {
+                          "heading": "Entry title line (role/company/dates OR project name/tech/dates)",
+                          "bullets": [
+                            "Rewritten bullet starting with action verb",
+                            "Another bullet with metric or outcome"
+                          ]
+                        }
+                      ]
+                    }
+                  ],
+                  "changesLog": ["Injected containerization into Projects bullet", "Strengthened 3 weak verbs"]
+                }
+
+                IMPORTANT: sections in your JSON must follow the section order above EXACTLY.
+                Every section from the discovered list must appear in your output.
+                Required sections (%d total): %s
+                """.formatted(
+                roleLabel,
+                plan.getProfileType(),
+                careerBlock,
+                resumeText,
+                effectiveJD,
+                formatSectionList(plan.getRankedSections()),
+                formatKeywordList(plan.getInjectableKeywords()),
+                formatKeywordList(plan.getMustBoldKeywords()),
+                plan.getDiscoveredSections().size(),
+                String.join(", ", plan.getDiscoveredSections())
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 2b — LaTeX system instruction + generator
+    // ─────────────────────────────────────────────────────────────────────────
+
     public String latexSystemInstruction() {
         return """
-                You are an expert LaTeX resume engineer and ATS optimization specialist.
+                You are an expert LaTeX resume engineer.
                 You produce ONLY valid LaTeX source code that compiles with Tectonic (pdflatex-compatible).
 
                 ══ TECTONIC COMPILATION RULES (NEVER VIOLATE) ══
@@ -174,175 +280,88 @@ public class LatexPromptBuilder {
                 7. No \\input or \\include — everything in one file
                 8. End document with \\end{document} as the very last line
 
-                ══ RESHAPE EXECUTION RULES ══
-                1. Section order is given explicitly in each prompt — follow it EXACTLY
-                2. Bold these with \\textbf{}: the mustBoldKeywords list given in each prompt,
-                   plus any numbers, metrics, certification names, company names, percentages
-                3. Inject injectableKeywords naturally into existing bullets — do NOT add new bullets
-                4. Bullet points: action verb + what was built + outcome/metric
-                5. Keep ALL content from original — remove nothing
-                6. Compress spacing:
+                ══ FORMATTING RULES ══
+                1. Compress spacing:
                    \\titlespacing*{\\section}{0pt}{6pt}{3pt}
                    itemize: leftmargin=14pt, noitemsep, topsep=1pt
-                7. Header: name in large font, contact info on one line with | separators
-
-                ══ SECTION ORDER IS DYNAMIC — NEVER HARDCODE IT ══
-                The section order for every resume is provided in the prompt.
-                Do not assume any fixed order. Follow the rankedSections list precisely.
-                """;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Prompt 1: PDF text → LaTeX reshape (plan-aware)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    public String pdfToLatexReshapePrompt(String extractedText,
-                                          ResumePlan plan,
-                                          String roleLabel,
-                                          String jdText) {
-        String effectiveJD = buildEffectiveJD(roleLabel, jdText);
-
-        return """
-                Convert the following extracted resume text into a complete, ATS-optimised
-                LaTeX resume for the role: "%s"
-                Candidate profile type: %s
-
-                ══ EXTRACTED RESUME TEXT ══
-                (Lines prefixed [HEADING] = section titles, [BOLD] = important labels,
-                 [BULLET] = bullet points. Plain lines = body text.)
-
-                %s
-
-                ══ TARGET JOB DESCRIPTION ══
-                %s
-
-                ══ SECTION ORDER — FOLLOW EXACTLY, DO NOT DEVIATE ══
-                %s
-
-                ══ PRESERVATION AUDIT — VERIFY BEFORE OUTPUTTING ══
-                The following %d sections were discovered in the original resume.
-                Your LaTeX output MUST contain a \\section{} block for EVERY one of them.
-                Missing even one section is a critical failure.
-                Discovered sections: %s
-
-                ══ KEYWORD INSTRUCTIONS ══
-                Wrap these keywords in \\textbf{} wherever they appear naturally in content:
-                Bold keywords: %s
-
-                Inject these keywords naturally into existing bullets (do NOT add new bullets):
-                Injectable keywords: %s
-
-                ══ YOUR TASK ══
-                1. Reconstruct the full resume as valid Tectonic-compilable LaTeX
-                2. Follow section order above EXACTLY — Header first, then ranked sections
-                3. Apply ALL reshape rules from your system instruction
-                4. Preserve every fact, project, achievement, education entry, and
-                   leadership/responsibility entry — remove NOTHING
+                2. Header: name in large font, contact info on one line with | separators
+                3. Bold keywords and metrics with \\textbf{} as instructed in each prompt
+                4. Bullet points come from the structured JSON — do NOT rephrase or reorder them
                 5. Escape ALL special LaTeX characters in content:
                    & → \\& | %% → \\%% | $ → \\$ | # → \\# | _ → \\_ | ^ → \\^{}
                    ~ → \\textasciitilde{} | < → \\textless{} | > → \\textgreater{}
-                6. Before finalising output, count your \\section{} blocks — must equal %d
 
-                ══ OUTPUT FORMAT ══
-                Return ONLY this JSON — no markdown fences, no extra fields:
-                {
-                  "shapedLatex": "...complete \\\\documentclass...\\\\end{document} source...",
-                  "changesLog": ["change1", "change2"]
-                }
-                """.formatted(
-                roleLabel,
-                plan.getProfileType(),
-                extractedText,
-                effectiveJD,
-                formatSectionList(plan.getRankedSections()),
-                plan.getDiscoveredSections().size(),
-                String.join(", ", plan.getDiscoveredSections()),
-                formatKeywordList(plan.getMustBoldKeywords()),
-                formatKeywordList(plan.getInjectableKeywords()),
-                plan.getDiscoveredSections().size()
-        );
+                ══ SECTION ORDER IS DYNAMIC — NEVER HARDCODE IT ══
+                The section order is provided in every prompt. Follow it precisely.
+                """;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Prompt 2: LaTeX → reshape (user uploaded .tex directly, plan-aware)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    public String latexReshapePrompt(String rawLatex,
-                                     ResumePlan plan,
-                                     String roleLabel,
-                                     String jdText) {
-        String effectiveJD = buildEffectiveJD(roleLabel, jdText);
-
+    public String latexGeneratePrompt(String structuredContentJson,
+                                      ResumePlan plan,
+                                      String roleLabel) {
         return """
-                Reshape the following LaTeX resume for the role: "%s"
-                Candidate profile type: %s
+                Convert this structured resume content into valid Tectonic-compilable LaTeX.
+                Role: "%s" | Profile: %s
 
-                ══ ORIGINAL LATEX ══
-                %s
+                ══ STRUCTURED CONTENT (JSON) ══
+                This is the complete resume content. Render every section and every bullet
+                exactly as given — do NOT rephrase, reorder bullets, or drop any entry.
 
-                ══ TARGET JOB DESCRIPTION ══
                 %s
 
                 ══ SECTION ORDER — FOLLOW EXACTLY, DO NOT DEVIATE ══
                 %s
 
+                ══ BOLD THESE KEYWORDS with \\textbf{} ══
+                Wrap each of these in \\textbf{} wherever they appear in the content.
+                Also bold all numbers, percentages, and metrics automatically.
+                Keywords: %s
+
+                ══ KEYWORD FREQUENCY CAP ══
+                Each keyword may be wrapped in \\textbf{} AT MOST 3 times total.
+                After the 3rd occurrence, leave it unbolded.
+
                 ══ PRESERVATION AUDIT — VERIFY BEFORE OUTPUTTING ══
-                The following %d sections were discovered in the original resume.
-                Your LaTeX output MUST contain a \\section{} block for EVERY one of them.
+                Your LaTeX output MUST contain a \\section{} block for EVERY one of these sections.
                 Missing even one section is a critical failure.
-                Discovered sections: %s
-
-                ══ KEYWORD INSTRUCTIONS ══
-                Wrap these keywords in \\textbf{} wherever they appear naturally in content:
-                Bold keywords: %s
-
-                Inject these keywords naturally into existing bullets (do NOT add new bullets):
-                Injectable keywords: %s
+                Required sections (%d total): %s
 
                 ══ YOUR TASK ══
-                1. Apply ALL reshape rules from your system instruction
-                2. Follow section order above EXACTLY
-                3. Bold all numbers, metrics, and bold keywords with \\textbf{}
-                4. Strengthen bullet verbs and inject injectable keywords naturally
-                5. Fix any spacing issues (tight itemize options, compressed section spacing)
-                6. Preserve ALL content — same projects, education, achievements,
-                   leadership roles, positions of responsibility — remove NOTHING
-                7. Output must be valid Tectonic-compilable LaTeX
-                8. Before finalising output, count your \\section{} blocks — must equal %d
+                1. Build a complete \\documentclass..\\end{document} LaTeX file
+                2. Follow section order above EXACTLY — Header first, then ranked sections
+                3. Apply ALL formatting rules from your system instruction
+                4. Before finalising, count your \\section{} blocks — must equal %d
+                5. Every \\begin{itemize} must have [leftmargin=14pt,noitemsep,topsep=1pt]
 
                 ══ OUTPUT FORMAT ══
-                Return ONLY this JSON — no markdown fences, no extra fields:
-                {
-                  "shapedLatex": "...complete \\\\documentclass...\\\\end{document} source...",
-                  "changesLog": ["change1", "change2"]
-                }
+                Output ONLY the LaTeX source between these exact delimiters.
+                No explanation, no markdown fences, nothing before <<<LATEX>>> or after <<<END_LATEX>>>.
+
+                <<<LATEX>>>
+                \\documentclass[10pt,a4paper]{article}
+                ... complete LaTeX source ...
+                \\end{document}
+                <<<END_LATEX>>>
                 """.formatted(
                 roleLabel,
                 plan.getProfileType(),
-                rawLatex,
-                effectiveJD,
+                structuredContentJson,
                 formatSectionList(plan.getRankedSections()),
+                formatKeywordList(plan.getMustBoldKeywords()),
                 plan.getDiscoveredSections().size(),
                 String.join(", ", plan.getDiscoveredSections()),
-                formatKeywordList(plan.getMustBoldKeywords()),
-                formatKeywordList(plan.getInjectableKeywords()),
                 plan.getDiscoveredSections().size()
         );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Prompt 3: Fix LaTeX syntax errors — plan-aware, escalating strategy
+    // Fix loop
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * @param attempt  compile attempt number (2 = standard fix, 3 = aggressive fix)
-     * @param plan     used to enforce section preservation during fix
-     */
     public String latexFixPrompt(String brokenLatex,
                                  String compilerLog,
                                  ResumePlan plan,
                                  int attempt) {
-
         String sectionConstraints = buildSectionConstraints(plan);
         String strategyBlock      = attempt >= 3
                 ? aggressiveFixStrategy()
@@ -431,7 +450,103 @@ public class LatexPromptBuilder {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Prompt 4: ATS scoring — unchanged, called AFTER successful compile
+    // STAGE 7 — Fit to 1 page prompts
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public String spacingExpandPrompt(String latex) {
+        return """
+                The compiled LaTeX resume is shorter than one full page.
+                Adjust spacing ONLY to fill the page better. Do NOT change any content.
+
+                ══ ALLOWED CHANGES ══
+                - Increase \\vspace{} between sections (max 8pt)
+                - Increase \\titlespacing* top/bottom values slightly
+                - Increase itemize topsep from 1pt to 3pt
+                - Add \\medskip between entries if space allows
+                - Increase geometry top/bottom margins slightly (max 1in total)
+
+                ══ NOT ALLOWED ══
+                - Change any text, bullets, keywords, or facts
+                - Add new content or sections
+                - Change font sizes
+                - Change section order
+
+                ══ LATEX SOURCE ══
+                %s
+
+                ══ OUTPUT FORMAT ══
+                Output ONLY between delimiters — no explanation:
+                <<<LATEX>>>
+                ... adjusted latex ...
+                <<<END_LATEX>>>
+                """.formatted(latex);
+    }
+
+    public String sizingCompressPrompt(String latex, double pageCount) {
+        return """
+                The compiled LaTeX resume is %.1f pages. It MUST fit on exactly 1 page.
+                Compress sizing and spacing to fit. Do NOT remove any content.
+
+                ══ ALLOWED CHANGES (apply ALL that are needed) ══
+                - Reduce \\documentclass font size to 9pt or 9.5pt
+                - Reduce geometry margins (minimum: top=0.4in, bottom=0.4in, left=0.5in, right=0.5in)
+                - Reduce \\titlespacing* to {0pt}{3pt}{1pt}
+                - Reduce itemize topsep to 0pt, noitemsep
+                - Reduce \\vspace{} between sections to 2pt
+                - Add \\setlength{\\parskip}{0pt} to kill paragraph spacing
+
+                ══ NOT ALLOWED ══
+                - Remove any bullet points, sections, or text
+                - Change any content, keywords, or facts
+                - Use font sizes below 9pt
+                - Use margins below 0.4in
+
+                ══ LATEX SOURCE ══
+                %s
+
+                ══ OUTPUT FORMAT ══
+                <<<LATEX>>>
+                ... compressed latex ...
+                <<<END_LATEX>>>
+                """.formatted(pageCount, latex);
+    }
+
+    public String contentTrimPrompt(String latex, double pageCount) {
+        return """
+                The compiled LaTeX resume is %.1f pages. Spacing and sizing fixes were insufficient.
+                You MUST trim content to fit exactly 1 page. This is the last resort.
+
+                ══ TRIM PRIORITY — remove in this order ══
+                1. Hobbies, Interests, Extra Curriculars section entirely (lowest ATS value)
+                2. "References available on request" lines
+                3. Objective/Summary section if it is generic (under 2 strong sentences)
+                4. Duplicate or near-duplicate bullets within the same entry
+                5. The WEAKEST bullet in each section — least specific, no metric, no impact
+                   (remove at most 1 bullet per section)
+                6. Reduce any entry with 4+ bullets to 3 bullets (keep the strongest 3)
+
+                ══ NEVER REMOVE ══
+                - Education section
+                - Any bullet with a specific metric (%%, $, ms, req/sec, users, etc.)
+                - Any bullet containing a bold keyword
+                - Contact information or dates
+
+                ══ AFTER TRIMMING — also apply maximum spacing compression ══
+                - Font: 9pt, margins: 0.45in all sides
+                - titlespacing: {0pt}{2pt}{1pt}, topsep: 0pt, parskip: 0pt
+
+                ══ LATEX SOURCE ══
+                %s
+
+                ══ OUTPUT FORMAT ══
+                <<<LATEX>>>
+                ... trimmed and compressed latex ...
+                <<<END_LATEX>>>
+                """.formatted(pageCount, latex);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ATS scoring
     // ─────────────────────────────────────────────────────────────────────────
 
     public String atsScorePrompt(String extractedOriginalText,
@@ -449,6 +564,12 @@ public class LatexPromptBuilder {
                 Score both versions. Consider: keyword density, strong action verbs,
                 quantified metrics, relevant skills, section completeness.
 
+                Penalise heavily for:
+                - Same keyword repeated 3+ times (-5 pts each offence)
+                - Bullets that don't start with action verbs
+                - Missing metrics on experience bullets
+                - Capitalisation errors mid-sentence
+
                 Return ONLY this JSON — no markdown fences:
                 {
                   "atsScoreBefore": 0-100,
@@ -458,13 +579,43 @@ public class LatexPromptBuilder {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // CAREER_SWITCHER block
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private String buildCareerSwitcherBlock(String profileType, String roleLabel) {
+        if (!"CAREER_SWITCHER".equals(profileType)) return "";
+
+        return """
+                ══ CAREER SWITCHER STRATEGY — THIS OVERRIDES DEFAULT REWRITE BEHAVIOUR ══
+                This candidate is transitioning careers. Their background does not directly
+                match the target role: "%s". Apply these rules with high priority:
+
+                1. SUMMARY SECTION — rewrite completely:
+                   - Lead with transferable skills that map directly to the target role
+                   - Frame their narrative toward where they are going, not where they came from
+                   - Do NOT mention "career change" or "transitioning" explicitly
+                   - Maximum 3 sentences — punchy, confident, forward-looking
+
+                2. EXPERIENCE BULLETS — reframe each bullet:
+                   - Lead with the transferable skill or outcome, not the job title or industry
+                   - De-emphasise industry-specific jargon that won't resonate with target role
+
+                3. SKILLS SECTION — reorder:
+                   - Put transferable and target-role-relevant skills first
+                   - Move domain-specific skills that don't transfer to the bottom
+
+                4. INJECTABLE KEYWORDS — prioritise aggressively:
+                   - For career switchers, injectable keywords bridge the gap
+                   - Inject all provided injectable keywords if ANY basis exists in the resume
+                   - Still respect the 2-occurrence frequency cap per keyword
+
+                """.formatted(roleLabel);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Formats ranked sections as a numbered list for the prompt.
-     * e.g. "1. Summary\n2. Projects\n3. Technical Skills\n..."
-     */
     private String formatSectionList(List<String> sections) {
         if (sections == null || sections.isEmpty()) return "(none)";
         StringBuilder sb = new StringBuilder();
@@ -474,21 +625,13 @@ public class LatexPromptBuilder {
         return sb.toString().stripTrailing();
     }
 
-    /**
-     * Formats a keyword list as a comma-separated string.
-     * Returns "(none)" if empty so the prompt is never blank.
-     */
     private String formatKeywordList(List<String> keywords) {
         if (keywords == null || keywords.isEmpty()) return "(none)";
         return String.join(", ", keywords);
     }
 
-    /**
-     * Builds the effective JD for reshape and planner prompts.
-     * If user provided a JD it is merged 50/50 with the system default.
-     */
     private String buildEffectiveJD(String roleLabel, String userJD) {
-        String systemJD   = JobDescriptions.getDefault(roleLabel);
+        String  systemJD  = JobDescriptions.getDefault(roleLabel);
         boolean hasUserJD = userJD != null && !userJD.isBlank();
 
         if (!hasUserJD) return systemJD;

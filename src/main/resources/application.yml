@@ -157,4 +157,3 @@ app:
       path: ${app.latex.tectonic.path:tectonic}
     compile:
       timeout-seconds: ${app.latex.compile.timeout-seconds:60}    # kill runaway compile after 60s
-

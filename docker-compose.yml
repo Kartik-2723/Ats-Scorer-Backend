@@ -28,7 +28,7 @@ services:
       JWT_SECRET: ${JWT_SECRET}
 
       # Gemini
-      GEMINI_API_KEY: AIzaSyAJXZz8hvC-ZiW0VrxIfHGCs5biebNBdjo
+      GEMINI_API_KEY: AIzaSyCFy_VGuDvoUw6O8Od8vgQ_YD85JaNOhIY
 
       # AWS S3
       S3_BUCKET:          ${S3_BUCKET}
@@ -51,8 +51,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - tectonic_cache:/home/appuser/.cache/tectonic
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
@@ -110,4 +108,3 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  tectonic_cache:

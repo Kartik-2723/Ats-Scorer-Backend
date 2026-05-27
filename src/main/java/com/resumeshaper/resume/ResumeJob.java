@@ -24,7 +24,6 @@ public class ResumeJob {
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
-    // Owner – either a logged-in user or a guest token
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "user_id")
     private User user;
@@ -32,7 +31,6 @@ public class ResumeJob {
     @Column(name = "guest_token")
     private String guestToken;
 
-    // Role
     @Column(name = "role_label", nullable = false)
     private String roleLabel;
 
@@ -43,11 +41,9 @@ public class ResumeJob {
     @Builder.Default
     private boolean customRole = false;
 
-    // Job description
     @Column(name = "jd_text", columnDefinition = "TEXT")
     private String jdText;
 
-    // Files (S3 keys)
     @Column(name = "original_file_key", nullable = false)
     private String originalFileKey;
 
@@ -59,62 +55,35 @@ public class ResumeJob {
 
     // ── LaTeX pipeline fields ────────────────────────────────────────────────
 
-    /**
-     * Whether the user uploaded a PDF or raw LaTeX.
-     * Null for jobs created via the old JSON-reshape pipeline.
-     */
     @Enumerated(EnumType.STRING)
     @Column(name = "input_type", length = 10)
     private InputType inputType;
 
-    /**
-     * Original LaTeX source:
-     *  - If inputType=LATEX: the raw uploaded .tex content
-     *  - If inputType=PDF:   the LLM-converted LaTeX from PDF text extraction
-     * Kept for audit and retry. Never sent to frontend.
-     */
     @Column(name = "raw_latex", columnDefinition = "TEXT")
     private String rawLatex;
 
-    /**
-     * Final reshaped + Tectonic-validated LaTeX.
-     * This is what the frontend editor receives and pre-renders.
-     */
     @Column(name = "shaped_latex", columnDefinition = "TEXT")
     private String shapedLatex;
 
-    /**
-     * S3 key of the backend-compiled PDF.
-     * Pre-signed URL generated on result fetch — frontend renders PDF
-     * instantly from Redis cache (LatexCompilerService caches by SHA-256).
-     */
     @Column(name = "compiled_pdf_key")
     private String compiledPdfKey;
 
-    /**
-     * How many Tectonic compile attempts have been made.
-     * Max 3 (1 initial + 2 LLM fix retries). If all fail → FAILED.
-     */
     @Column(name = "latex_compile_attempts")
     @Builder.Default
     private int latexCompileAttempts = 0;
 
-    // ── Planner output fields (populated during RESHAPING_LATEX phase) ───────
+    // ── Planner output fields ────────────────────────────────────────────────
 
     /**
-     * Candidate career stage detected by the planner LLM.
-     * Values: STUDENT_FRESHER | EARLY_CAREER | MID_SENIOR | CAREER_SWITCHER
-     * Stored for analytics and optional frontend display.
+     * Career stage detected by the planner.
+     * STUDENT_FRESHER | EARLY_CAREER | MID_SENIOR | CAREER_SWITCHER
      */
     @Column(name = "profile_type_detected", length = 30)
     private String profileTypeDetected;
 
     /**
-     * JD keywords that are completely absent from the resume with no
-     * injectable basis. Surfaced to the frontend after DONE as
-     * "Add these keywords manually to improve your ATS score further".
-     *
-     * Stored as a JSON string array: ["Kubernetes", "CI/CD", "Terraform"]
+     * JD keywords absent from resume with no injectable basis.
+     * Surfaced to frontend as "Add these manually" suggestions.
      */
     @Type(JsonBinaryType.class)
     @Column(name = "ats_gap_keywords", columnDefinition = "jsonb")
@@ -123,15 +92,26 @@ public class ResumeJob {
     /**
      * Per-bullet content improvement suggestions from the planner.
      * Each entry: { section, bullet, suggestion }
-     * Stored for optional "Improve your resume" panel in the frontend.
-     *
-     * Non-blocking — never affects LaTeX compilation or job status.
      */
     @Type(JsonBinaryType.class)
     @Column(name = "content_flags", columnDefinition = "jsonb")
     private List<Map<String, String>> contentFlags;
 
-    // ── Old JSON-reshape pipeline fields (unchanged) ─────────────────────────
+    // ── ATS scoring fields ───────────────────────────────────────────────────
+
+    /**
+     * FIX 4: Full rules-based ATS breakdown for the ORIGINAL resume.
+     * Stored as JSONB: { overallScore, keywordScore, sectionScore,
+     *                    formatScore, verbScore, matchedKeywords,
+     *                    missingKeywords, presentSections, formatIssues }
+     * Surfaced to frontend as a score breakdown chart.
+     * Requires migration: V4__add_ats_report_column.sql
+     */
+    @Type(JsonBinaryType.class)
+    @Column(name = "ats_report", columnDefinition = "jsonb")
+    private Map<String, Object> atsReport;
+
+    // ── Old JSON-reshape pipeline fields ─────────────────────────────────────
 
     @Type(JsonBinaryType.class)
     @Column(name = "parsed_resume", columnDefinition = "jsonb")
@@ -145,18 +125,13 @@ public class ResumeJob {
     @Column(name = "jd_analysis", columnDefinition = "jsonb")
     private Map<String, Object> jdAnalysis;
 
-    @Type(JsonBinaryType.class)
-    @Column(name = "ats_report", columnDefinition = "jsonb")
-    private Map<String, Object> atsReport;
-
-    // ATS scores (used by both pipelines)
+    // ATS scores (both pipelines)
     @Column(name = "ats_score_before")
     private Integer atsScoreBefore;
 
     @Column(name = "ats_score_after")
     private Integer atsScoreAfter;
 
-    // Pipeline status
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     @Builder.Default
@@ -168,12 +143,10 @@ public class ResumeJob {
     @Builder.Default
     private boolean starred = false;
 
-    // Versions
     @OneToMany(mappedBy = "job", cascade = CascadeType.ALL, orphanRemoval = true)
     @Builder.Default
     private List<ResumeVersion> versions = List.of();
 
-    // Timestamps
     @Column(name = "created_at", updatable = false)
     @Builder.Default
     private OffsetDateTime createdAt = OffsetDateTime.now();

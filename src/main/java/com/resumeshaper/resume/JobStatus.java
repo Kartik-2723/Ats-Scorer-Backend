@@ -6,9 +6,9 @@ package com.resumeshaper.resume;
  * Old flow:  PENDING → PARSING → ANALYZING → RESHAPING → SCORING → DONE | FAILED
  *
  * New LaTeX flow:
- *   PDF input:   PENDING → CONVERTING → RESHAPING_LATEX → COMPILING → DONE | FAILED
- *   LaTeX input: PENDING → RESHAPING_LATEX → COMPILING → DONE | FAILED
- *   On compile error: COMPILING → FIX_RETRY → COMPILING → DONE | FAILED
+ *   PDF input:   PENDING → CONVERTING → RESHAPING_LATEX → COMPILING → FITTING_PAGE → DONE | FAILED
+ *   LaTeX input: PENDING → RESHAPING_LATEX → COMPILING → FITTING_PAGE → DONE | FAILED
+ *   On compile error: COMPILING → FIX_RETRY → COMPILING → FITTING_PAGE → DONE | FAILED
  */
 public enum JobStatus {
 
@@ -34,5 +34,8 @@ public enum JobStatus {
     COMPILING,
 
     /** LLM fix-on-error: syntax fix only, no content changes */
-    FIX_RETRY
+    FIX_RETRY,
+
+    /** Fit resume to exactly 1 page: spacing → sizing → content trim */
+    FITTING_PAGE
 }

@@ -1,5 +1,6 @@
 package com.resumeshaper.latex;
 
+import com.resumeshaper.ats.ATSReport;
 import com.resumeshaper.common.dto.ApiResponse;
 import com.resumeshaper.common.exception.AppException;
 import com.resumeshaper.resume.InputType;
@@ -19,7 +20,6 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -29,7 +29,10 @@ import java.util.UUID;
  *
  * POST /api/latex/reshape              — submit PDF or .tex file
  * GET  /api/latex/reshape/{id}/status  — poll until DONE | FAILED
- * GET  /api/latex/reshape/{id}/result  — fetch shapedLatex + pdfUrl when DONE
+ * GET  /api/latex/reshape/{id}/result  — fetch full result when DONE
+ *
+ * FIX 5: result endpoint now maps contentFlags, atsGapKeywords,
+ * profileTypeDetected, and atsReport into LatexReshapeResponse.
  */
 @Slf4j
 @RestController
@@ -41,8 +44,8 @@ public class LatexReshapeController {
             "application/pdf", "application/x-pdf");
     private static final List<String> ALLOWED_TEX_TYPES = List.of(
             "text/plain", "application/x-tex", "text/x-tex",
-            "application/octet-stream");   // browsers often send .tex as octet-stream
-    private static final long MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MB
+            "application/octet-stream");
+    private static final long MAX_FILE_BYTES = 10 * 1024 * 1024;
 
     private final LatexReshapeOrchestrator orchestrator;
     private final ResumeJobRepository      jobRepository;
@@ -51,7 +54,6 @@ public class LatexReshapeController {
 
     // ─────────────────────────────────────────────────────────────────────────
     // POST /api/latex/reshape
-    // Accepts multipart: file (PDF or .tex) + metadata fields
     // ─────────────────────────────────────────────────────────────────────────
 
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -65,10 +67,8 @@ public class LatexReshapeController {
             @AuthenticationPrincipal User user
     ) throws IOException {
 
-        // ── Auth check ────────────────────────────────────────────────────────
         validateOwner(guestToken, user);
 
-        // ── File validation ───────────────────────────────────────────────────
         if (file.isEmpty()) {
             throw new AppException("Uploaded file is empty", HttpStatus.BAD_REQUEST);
         }
@@ -80,7 +80,6 @@ public class LatexReshapeController {
         log.info("LaTeX reshape submit: inputType={} role={} user/guest={}",
                 inputType, roleLabel, user != null ? user.getEmail() : guestToken);
 
-        // ── Build request ─────────────────────────────────────────────────────
         LatexReshapeRequest req = new LatexReshapeRequest();
         req.setRoleLabel(roleLabel);
         req.setRoleCategory(roleCategory);
@@ -88,7 +87,6 @@ public class LatexReshapeController {
         req.setJdText(jdText);
         req.setGuestToken(guestToken);
 
-        // ── Create job + kick off async pipeline ──────────────────────────────
         ResumeJob job = orchestrator.submit(file, inputType, req, user);
 
         return ResponseEntity.accepted().body(ApiResponse.success(Map.of(
@@ -99,7 +97,6 @@ public class LatexReshapeController {
 
     // ─────────────────────────────────────────────────────────────────────────
     // GET /api/latex/reshape/{jobId}/status
-    // Lightweight poll endpoint — frontend hits this until DONE | FAILED
     // ─────────────────────────────────────────────────────────────────────────
 
     @GetMapping("/{jobId}/status")
@@ -124,7 +121,7 @@ public class LatexReshapeController {
 
     // ─────────────────────────────────────────────────────────────────────────
     // GET /api/latex/reshape/{jobId}/result
-    // Returns full result — only call when status == DONE
+    // FIX 5: maps contentFlags, atsGapKeywords, profileTypeDetected, atsReport
     // ─────────────────────────────────────────────────────────────────────────
 
     @GetMapping("/{jobId}/result")
@@ -135,20 +132,26 @@ public class LatexReshapeController {
     ) {
         ResumeJob job = findAndAuthorize(jobId, guestToken, user);
 
+        // LatexReshapeController.java — result endpoint
         if (job.getStatus() != JobStatus.DONE) {
-            throw new AppException(
-                    "Job is not complete yet. Current status: " + job.getStatus(),
-                    HttpStatus.CONFLICT);
+            return ResponseEntity.status(HttpStatus.ACCEPTED)
+                    .body(ApiResponse.success((LatexReshapeResponse) Map.of(   // or a typed wrapper
+                            "status", job.getStatus(),
+                            "message", "Job not complete yet"
+                    )));
         }
 
-        // Generate pre-signed PDF URL (60 min TTL, from AppProperties)
         String pdfUrl = storage.presignedUrl(job.getCompiledPdfKey());
 
-        // Parse changesLog from shapedResume JSONB if present, else empty list
+        // Parse changesLog from shapedResume JSONB
         @SuppressWarnings("unchecked")
         List<String> changesLog = job.getShapedResume() != null
                 ? (List<String>) job.getShapedResume().getOrDefault("changesLog", List.of())
                 : List.of();
+
+        // FIX 5: reconstruct ATSReport from stored atsReport JSONB
+        // Falls back to null gracefully if not yet computed
+        ATSReport atsReport = buildAtsReportFromJob(job);
 
         LatexReshapeResponse response = LatexReshapeResponse.builder()
                 .jobId(job.getId())
@@ -158,13 +161,20 @@ public class LatexReshapeController {
                 .atsScoreAfter(job.getAtsScoreAfter())
                 .changesLog(changesLog)
                 .compileAttempts(job.getLatexCompileAttempts())
+                // FIX 5: new fields
+                .profileTypeDetected(job.getProfileTypeDetected())
+                .atsGapKeywords(job.getAtsGapKeywords() != null
+                        ? job.getAtsGapKeywords() : List.of())
+                .contentFlags(job.getContentFlags() != null
+                        ? job.getContentFlags() : List.of())
+                .atsReport(atsReport)
                 .build();
 
         return ResponseEntity.ok(ApiResponse.success(response));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Exception handler — compile errors
+    // Exception handler
     // ─────────────────────────────────────────────────────────────────────────
 
     @ExceptionHandler(LatexCompileException.class)
@@ -179,18 +189,62 @@ public class LatexReshapeController {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * FIX 5: Reconstruct ATSReport from the atsReport JSONB column.
+     * Stored as Map by the orchestrator, reconstructed here for type-safe response.
+     * Returns null gracefully if the rules-based scorer hasn't run yet
+     * (e.g. old jobs created before this fix was deployed).
+     */
+    @SuppressWarnings("unchecked")
+    private ATSReport buildAtsReportFromJob(ResumeJob job) {
+        Map<String, Object> raw = job.getAtsReport();
+        if (raw == null || raw.isEmpty()) return null;
+
+        try {
+            return ATSReport.builder()
+                    .overallScore(toInt(raw.get("overallScore")))
+                    .keywordScore(toInt(raw.get("keywordScore")))
+                    .sectionScore(toInt(raw.get("sectionScore")))
+                    .formatScore(toInt(raw.get("formatScore")))
+                    .verbScore(toInt(raw.get("verbScore")))
+                    .matchedKeywords(toStringList(raw.get("matchedKeywords")))
+                    .missingKeywords(toStringList(raw.get("missingKeywords")))
+                    .presentSections(toStringList(raw.get("presentSections")))
+                    .formatIssues(toStringList(raw.get("formatIssues")))
+                    .build();
+        } catch (Exception ex) {
+            log.warn("job={} failed to reconstruct ATSReport from JSONB: {}",
+                    job.getId(), ex.getMessage());
+            return null;
+        }
+    }
+
+    private int toInt(Object v) {
+        if (v instanceof Number n) return n.intValue();
+        return 0;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> toStringList(Object v) {
+        if (v instanceof List<?> list) {
+            return list.stream()
+                    .filter(i -> i instanceof String)
+                    .map(i -> (String) i)
+                    .toList();
+        }
+        return List.of();
+    }
+
     private InputType detectInputType(MultipartFile file) {
         String originalName = file.getOriginalFilename();
         String contentType  = file.getContentType();
 
-        // Prefer filename extension — more reliable than browser MIME
         if (originalName != null) {
             String lower = originalName.toLowerCase();
             if (lower.endsWith(".tex") || lower.endsWith(".latex")) return InputType.LATEX;
             if (lower.endsWith(".pdf"))                              return InputType.PDF;
         }
 
-        // Fall back to content type
         if (contentType != null) {
             if (ALLOWED_PDF_TYPES.stream().anyMatch(contentType::startsWith)) return InputType.PDF;
             if (ALLOWED_TEX_TYPES.stream().anyMatch(contentType::startsWith)) return InputType.LATEX;
@@ -208,7 +262,7 @@ public class LatexReshapeController {
                     HttpStatus.UNAUTHORIZED);
         }
         if (user == null) {
-            guestSessionService.validate(guestToken);  // throws on invalid/expired
+            guestSessionService.validate(guestToken);
         }
     }
 

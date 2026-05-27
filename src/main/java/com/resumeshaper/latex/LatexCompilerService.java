@@ -15,12 +15,13 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
 
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class LatexCompilerService {
 
-    private static final String CACHE_PREFIX = "latex:pdf:";
+    private static final String CACHE_BASE      = "latex:pdf:";
     private static final long   CACHE_TTL_HOURS = 24;
 
     @Qualifier("latexRedisTemplate")
@@ -33,11 +34,24 @@ public class LatexCompilerService {
     private int timeoutSeconds;
 
     /**
+     * FIX 3 — version prefix invalidates stale cache entries automatically
+     * when Tectonic is updated. Bump latex.tectonic.version in
+     * application.properties after every Tectonic upgrade.
+     *
+     * Cache key format: "latex:pdf:{version}:{sha256(source)}"
+     */
+    @Value("${latex.tectonic.version:1.0}")
+    private String tectonicVersion;
+
+    /**
      * Compile LaTeX source to PDF bytes.
      * Results are cached in Redis by SHA-256 hash of the source for 24 hours.
+     * Cache is version-scoped — bumping latex.tectonic.version invalidates all
+     * cached PDFs automatically without manual Redis flushes.
      */
     public byte[] compile(String latexSource) {
-        String cacheKey = CACHE_PREFIX + sha256(latexSource);
+        // FIX 3: version-scoped cache key
+        String cacheKey = CACHE_BASE + tectonicVersion + ":" + sha256(latexSource);
 
         // ── Cache hit ────────────────────────────────────────────────────────
         byte[] cached = redisTemplate.opsForValue().get(cacheKey);
@@ -56,11 +70,11 @@ public class LatexCompilerService {
             ProcessBuilder pb = new ProcessBuilder(
                     tectonicPath,
                     "--outdir", workDir.toString(),
-                    "--keep-logs",           // keep .log on failure for debugging
+                    "--keep-logs",
                     texFile.toString()
             );
             pb.directory(workDir.toFile());
-            pb.redirectErrorStream(true);   // stderr → stdout
+            pb.redirectErrorStream(true);
 
             Process process = pb.start();
             String output = new String(process.getInputStream().readAllBytes());
@@ -68,24 +82,27 @@ public class LatexCompilerService {
             boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
             if (!finished) {
                 process.destroyForcibly();
-                throw new LatexCompileException("Compilation timed out after " + timeoutSeconds + "s", output);
+                throw new LatexCompileException(
+                        "Compilation timed out after " + timeoutSeconds + "s", output);
             }
 
             if (process.exitValue() != 0) {
-                throw new LatexCompileException("Tectonic exited with code " + process.exitValue(), output);
+                throw new LatexCompileException(
+                        "Tectonic exited with code " + process.exitValue(), output);
             }
 
-            // Tectonic outputs <basename>.pdf in --outdir
             Path pdfFile = workDir.resolve("document.pdf");
             if (!Files.exists(pdfFile)) {
-                throw new LatexCompileException("PDF not produced — check LaTeX source", output);
+                throw new LatexCompileException(
+                        "PDF not produced — check LaTeX source", output);
             }
 
             byte[] pdf = Files.readAllBytes(pdfFile);
 
             // ── Cache store ──────────────────────────────────────────────────
             redisTemplate.opsForValue().set(cacheKey, pdf, CACHE_TTL_HOURS, TimeUnit.HOURS);
-            log.debug("LaTeX compiled and cached ({} bytes)", pdf.length);
+            log.debug("LaTeX compiled and cached ({} bytes) with key prefix v{}",
+                    pdf.length, tectonicVersion);
 
             return pdf;
 
@@ -97,7 +114,6 @@ public class LatexCompilerService {
         } catch (IOException e) {
             throw new LatexCompileException("IO error during compilation", e.getMessage());
         } finally {
-            // ── Cleanup temp directory ───────────────────────────────────────
             if (workDir != null) {
                 deleteSilently(workDir);
             }
