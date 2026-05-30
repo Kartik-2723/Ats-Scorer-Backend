@@ -452,7 +452,6 @@ public class LatexPromptBuilder {
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 7 — Fit to 1 page prompts
     // ─────────────────────────────────────────────────────────────────────────
-
     public String spacingExpandPrompt(String latex) {
         return """
                 The compiled LaTeX resume is shorter than one full page.

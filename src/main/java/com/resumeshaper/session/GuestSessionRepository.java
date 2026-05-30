@@ -1,5 +1,6 @@
 package com.resumeshaper.session;
 
+import com.resumeshaper.resume.ResumeJob;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -21,4 +22,5 @@ public interface GuestSessionRepository extends JpaRepository<GuestSession, Stri
           AND s.claimedBy IS NULL
         """)
     List<GuestSession> findExpiredUnclaimed(@Param("now") OffsetDateTime now);
+
 }

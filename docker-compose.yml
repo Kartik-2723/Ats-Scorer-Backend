@@ -28,7 +28,7 @@ services:
       JWT_SECRET: ${JWT_SECRET}
 
       # Gemini
-      GEMINI_API_KEY: AIzaSyCFy_VGuDvoUw6O8Od8vgQ_YD85JaNOhIY
+      GEMINI_API_KEY: AIzaSyCjvX9TXt9P72NI2do9FWvqvaaOj7qrmyE
 
       # AWS S3
       S3_BUCKET:          ${S3_BUCKET}

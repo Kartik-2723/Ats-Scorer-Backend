@@ -34,6 +34,7 @@ public class LLMOrchestrator {
             Map<String, Object> jdAnalysis;
             if (job.getJdText() != null && !job.getJdText().isBlank()) {
                 jdAnalysis = gemini.generateJson(
+                        null,
                         prompts.systemInstruction(),
                         prompts.jdAnalysisPrompt(job.getJdText(), job.getRoleLabel())
                 );
@@ -49,11 +50,13 @@ public class LLMOrchestrator {
 
             // ── Stage 2: Gap analysis + before score ──────────
             Map<String, Object> gapAnalysis = gemini.generateJson(
+                    null,
                     prompts.systemInstruction(),
                     prompts.gapAnalysisPrompt(job.getParsedResume(), jdAnalysis, job.getRoleLabel())
             );
 
             Map<String, Object> beforeScore = gemini.generateJson(
+                    null,
                     prompts.systemInstruction(),
                     prompts.originalScorePrompt(job.getParsedResume(), jdAnalysis)
             );
@@ -62,6 +65,7 @@ public class LLMOrchestrator {
             // ── Stage 3: Reshape ──────────────────────────────
             updateStatus(job, JobStatus.RESHAPING);
             Map<String, Object> shapedResume = gemini.generateJson(
+                    null,
                     prompts.systemInstruction(),
                     prompts.reshapePrompt(job.getParsedResume(), jdAnalysis, gapAnalysis, job.getRoleLabel())
             );
@@ -70,6 +74,7 @@ public class LLMOrchestrator {
             // ── Stage 4: ATS Score ────────────────────────────
             updateStatus(job, JobStatus.SCORING);
             Map<String, Object> atsReport = gemini.generateJson(
+                    null,
                     prompts.systemInstruction(),
                     prompts.atsScorePrompt(shapedResume, jdAnalysis)
             );

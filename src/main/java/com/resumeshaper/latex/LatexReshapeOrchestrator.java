@@ -10,6 +10,7 @@ import com.resumeshaper.resume.InputType;
 import com.resumeshaper.resume.JobStatus;
 import com.resumeshaper.resume.ResumeJob;
 import com.resumeshaper.resume.ResumeJobRepository;
+import com.resumeshaper.resume.ResumeQueueService;
 import com.resumeshaper.session.GuestSessionService;
 import com.resumeshaper.storage.S3FileStorageService;
 import com.resumeshaper.user.User;
@@ -38,7 +39,9 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class LatexReshapeOrchestrator {
 
-    private static final int MAX_COMPILE_ATTEMPTS = 3;
+    private static final int MAX_COMPILE_ATTEMPTS  = 3;
+    private static final int MIN_LATEX_LENGTH      = 1_500;
+    private static final int MIN_LATEX_FIX_LENGTH  = 500;
 
     private final PdfTextExtractor     pdfExtractor;
     private final GeminiApiClient      gemini;
@@ -50,6 +53,7 @@ public class LatexReshapeOrchestrator {
     private final ObjectMapper         objectMapper;
     private final ATSScoreService      atsScoreService;
     private final ApplicationContext   applicationContext;
+    private final ResumeQueueService   queueService;
 
     private static final List<JobStatus> ACTIVE_STATUSES = List.of(
             JobStatus.PENDING, JobStatus.CONVERTING,
@@ -59,7 +63,7 @@ public class LatexReshapeOrchestrator {
     private static final int IDEMPOTENCY_WINDOW_MINUTES = 30;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Entry point
+    // Entry point — new submission
     // ─────────────────────────────────────────────────────────────────────────
 
     @Transactional
@@ -104,15 +108,11 @@ public class LatexReshapeOrchestrator {
 
         job = jobRepository.save(job);
 
-        final UUID jobId     = job.getId();
-        final byte[] fileBytes = file.getBytes();
-        final LatexReshapeOrchestrator self =
-                applicationContext.getBean(LatexReshapeOrchestrator.class);
-
+        final UUID jobId = job.getId();
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                self.runPipeline(jobId, fileBytes, inputType, req);
+                queueService.enqueue(jobId);
             }
         });
 
@@ -120,19 +120,56 @@ public class LatexReshapeOrchestrator {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Async pipeline
+    // Retry entry point — resets existing job and re-enqueues
+    // The original file is already on S3; no re-upload needed.
     // ─────────────────────────────────────────────────────────────────────────
 
-    @Async("llmExecutor")
-    public void runPipeline(UUID jobId,
-                            byte[] fileBytes,
-                            InputType inputType,
-                            LatexReshapeRequest req) {
+    @Transactional
+    public void retrigger(ResumeJob job) {
+        log.info("Retrigger: jobId={} previousStatus={}", job.getId(), job.getStatus());
+
+        // Reset all pipeline output fields so the worker runs clean
+        job.setStatus(JobStatus.PENDING);
+        job.setErrorMessage(null);
+        job.setShapedLatex(null);
+        job.setCompiledPdfKey(null);
+        job.setLatexCompileAttempts(0);
+        job.setAtsScoreBefore(null);
+        job.setAtsScoreAfter(null);
+        job.setAtsReport(null);
+        job.setAtsGapKeywords(null);
+        job.setContentFlags(null);
+        job.setProfileTypeDetected(null);
+        job.setShapedResume(null);
+
+        // Keep rawLatex for LATEX input type — it was stored on first submit
+        // and is still valid. For PDF the pipeline re-reads from S3.
+
+        job = jobRepository.save(job);
+
+        final UUID jobId = job.getId();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                queueService.enqueue(jobId);
+            }
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pipeline — called by ResumeWorker
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public void runPipeline(UUID jobId, String keyId) {
 
         ResumeJob job = jobRepository.findById(jobId)
                 .orElseThrow(() -> new AppException("Job not found", HttpStatus.NOT_FOUND));
 
-        log.info("LaTeX reshape pipeline start: job={} inputType={}", jobId, inputType);
+        InputType inputType = job.getInputType();
+        String project = keyId != null ? keyId : "default";
+
+        log.info("Pipeline start: job={} project={} inputType={} role={}",
+                jobId, project, inputType, job.getRoleLabel());
 
         try {
             String rawLatex;
@@ -143,8 +180,10 @@ public class LatexReshapeOrchestrator {
             // ── Stage 1: Extract text (PDF only) ─────────────────────────────
             if (inputType == InputType.PDF) {
                 updateStatus(job, JobStatus.CONVERTING);
+                byte[] fileBytes = storage.downloadBytes(job.getOriginalFileKey());
                 extractedText = pdfExtractor.extract(fileBytes);
-                log.debug("job={} PDF extracted: {} chars", jobId, extractedText.length());
+                log.debug("job={} project={} PDF extracted: {} chars",
+                        jobId, project, extractedText.length());
                 updateStatus(job, JobStatus.RESHAPING_LATEX);
             }
 
@@ -152,35 +191,36 @@ public class LatexReshapeOrchestrator {
             String textForPlanner = (inputType == InputType.PDF)
                     ? extractedText : job.getRawLatex();
 
-            log.info("job={} Phase 1: running planner", jobId);
-            ResumePlan plan = runPlanner(jobId, textForPlanner, req);
+            log.info("job={} project={} Phase 1: planner", jobId, project);
+            ResumePlan plan = runPlanner(jobId, textForPlanner, job, keyId);
 
             savePlanMetadata(job, plan);
-            log.info("job={} Plan: profileType={} sections={} bold={} inject={} gaps={}",
-                    jobId, plan.getProfileType(), plan.getRankedSections(),
+            log.info("job={} project={} plan: profileType={} sections={} bold={} inject={} gaps={}",
+                    jobId, project, plan.getProfileType(), plan.getRankedSections(),
                     plan.getMustBoldKeywords(), plan.getInjectableKeywords(),
                     plan.getAtsGapKeywords());
 
-            String originalTextForScoring = textForPlanner;
-            scoreOriginalRulesBased(job, originalTextForScoring, plan);
+            scoreOriginalRulesBased(job, textForPlanner, plan);
 
             // ── Stage 3a: Content rewrite ─────────────────────────────────────
-            log.info("job={} Phase 2a: content rewrite", jobId);
+            log.info("job={} project={} Phase 2a: content rewrite", jobId, project);
             Map<String, Object> contentResult = gemini.generateJson(
+                    keyId,
                     latexPrompts.contentRewriteSystemInstruction(),
                     latexPrompts.contentRewritePrompt(
-                            textForPlanner, plan, req.getRoleLabel(), req.getJdText())
+                            textForPlanner, plan, job.getRoleLabel(), job.getJdText())
             );
             saveChangesLog(job, contentResult);
 
             String structuredContentJson = objectMapper.writeValueAsString(contentResult);
 
             // ── Stage 3b: LaTeX generation ────────────────────────────────────
-            log.info("job={} Phase 2b: LaTeX generation", jobId);
+            log.info("job={} project={} Phase 2b: LaTeX generation", jobId, project);
             rawLatex = gemini.generateLatex(
+                    keyId,
                     latexPrompts.latexSystemInstruction(),
                     latexPrompts.latexGeneratePrompt(
-                            structuredContentJson, plan, req.getRoleLabel())
+                            structuredContentJson, plan, job.getRoleLabel())
             );
             saveRawLatex(job, rawLatex);
 
@@ -194,12 +234,18 @@ public class LatexReshapeOrchestrator {
 
                 try {
                     compiledPdf = compiler.compile(latexToCompile);
-                    log.info("job={} Tectonic compile OK on attempt {}", jobId, attempt);
+                    log.info("job={} project={} compile OK on attempt {}",
+                            jobId, project, attempt);
                     break;
 
                 } catch (LatexCompileException ex) {
-                    log.warn("job={} compile failed attempt {}/{}: {}",
-                            jobId, attempt, MAX_COMPILE_ATTEMPTS, ex.getMessage());
+                    String logTail = ex.getCompilerLog() != null
+                            ? ex.getCompilerLog().substring(
+                            Math.max(0, ex.getCompilerLog().length() - 1500))
+                            : "(no compiler log)";
+                    log.warn("job={} project={} compile failed attempt {}/{}: {}\n── compiler log ──\n{}",
+                            jobId, project, attempt, MAX_COMPILE_ATTEMPTS,
+                            ex.getMessage(), logTail);
 
                     if (attempt == MAX_COMPILE_ATTEMPTS) {
                         throw new LatexCompileException(
@@ -209,8 +255,10 @@ public class LatexReshapeOrchestrator {
                     }
 
                     int fixAttempt = attempt + 1;
-                    log.info("job={} sending to LLM for fix (fixAttempt={})", jobId, fixAttempt);
+                    log.info("job={} project={} sending to LLM for fix (fixAttempt={})",
+                            jobId, project, fixAttempt);
                     Map<String, Object> fixResult = gemini.generateJson(
+                            keyId,
                             latexPrompts.latexSystemInstruction(),
                             latexPrompts.latexFixPrompt(
                                     latexToCompile, ex.getCompilerLog(), plan, fixAttempt)
@@ -219,13 +267,13 @@ public class LatexReshapeOrchestrator {
                 }
             }
 
-            // ── Stage 7: Fit to 1 page ────────────────────────────────────────
+            // ── Stage 5: Fit to 1 page ────────────────────────────────────────
             updateStatus(job, JobStatus.FITTING_PAGE);
-            FitPageResult fitResult = fitToOnePage(jobId, latexToCompile, compiledPdf, plan);
+            FitPageResult fitResult = fitToOnePage(jobId, project, latexToCompile, compiledPdf, plan, keyId);
             latexToCompile = fitResult.latex();
             compiledPdf    = fitResult.pdf();
 
-            // ── Stage 5: Upload compiled PDF ──────────────────────────────────
+            // ── Stage 6: Upload compiled PDF ──────────────────────────────────
             String pdfKey = storage.uploadBytes(
                     compiledPdf,
                     "compiled/" + jobId + "/resume.pdf",
@@ -233,56 +281,55 @@ public class LatexReshapeOrchestrator {
             );
 
             finalise(job, latexToCompile, pdfKey);
-            log.info("LaTeX reshape pipeline DONE: job={} profileType={} attempts={}",
-                    jobId, plan.getProfileType(), job.getLatexCompileAttempts());
+            log.info("Pipeline DONE: job={} project={} attempts={}",
+                    jobId, project, job.getLatexCompileAttempts());
 
-            // ── Stage 6: Async ATS score ──────────────────────────────────────
-            final UUID   finalJobId       = job.getId();
-            final String finalOriginalText = originalTextForScoring;
+            // ── Stage 7: Async ATS score ──────────────────────────────────────
+            final String finalOriginalText = textForPlanner;
             final String finalLatexCopy    = latexToCompile;
-            final String finalRole         = req.getRoleLabel();
 
             applicationContext.getBean(LatexReshapeOrchestrator.class)
-                    .scoreAsync(finalJobId, finalOriginalText, finalLatexCopy, finalRole);
+                    .scoreAsync(jobId, finalOriginalText, finalLatexCopy, job.getRoleLabel());
 
         } catch (GeminiQuotaExhaustedException ex) {
-            log.warn("All Gemini models quota-exhausted for job={}", jobId);
+            log.warn("All Gemini models quota-exhausted: job={} project={}", jobId, project);
             markFailed(job, "QUOTA_EXHAUSTED — all models rate-limited. Try again later.");
 
         } catch (LatexCompileException ex) {
-            log.error("job={} all compile attempts failed", jobId);
+            log.error("Compile failed: job={} project={}", jobId, project);
             markFailed(job, "LaTeX compile failed after " + MAX_COMPILE_ATTEMPTS +
                     " attempts: " + ex.getMessage());
 
         } catch (Exception ex) {
-            log.error("LaTeX reshape pipeline FAILED for job={}", jobId, ex);
+            log.error("Pipeline FAILED: job={} project={}", jobId, project, ex);
             markFailed(job, ex.getMessage());
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Stage 7 — Fit to 1 page (non-fatal, 3-tier)
+    // Stage 5 — Fit to 1 page (non-fatal, 3-tier)
     // ─────────────────────────────────────────────────────────────────────────
 
     private FitPageResult fitToOnePage(UUID jobId,
+                                       String project,
                                        String latex,
                                        byte[] pdf,
-                                       ResumePlan plan) {
+                                       ResumePlan plan,
+                                       String keyId) {
         int pages = countPdfPages(pdf);
-        log.info("job={} fit-page: detected {} page(s)", jobId, pages);
+        log.info("job={} project={} fit-page: detected {} page(s)", jobId, project, pages);
 
         if (pages == 1) {
-            log.info("job={} fit-page: already 1 page — skipping", jobId);
+            log.info("job={} project={} fit-page: already 1 page — skipping", jobId, project);
             return new FitPageResult(latex, pdf);
         }
 
-        // Tier 1: spacing expand — only if somehow 0 pages detected (defensive)
-        // In practice pages > 1 means we go straight to Tier 2
-
         // Tier 2: sizing compress
         try {
-            log.info("job={} fit-page Tier 2: sizing compress ({} pages)", jobId, pages);
+            log.info("job={} project={} fit-page Tier 2: sizing compress ({} pages)",
+                    jobId, project, pages);
             String compressedLatex = gemini.generateLatex(
+                    keyId,
                     latexPrompts.latexSystemInstruction(),
                     latexPrompts.sizingCompressPrompt(latex, pages)
             );
@@ -290,46 +337,48 @@ public class LatexReshapeOrchestrator {
             int newPages = countPdfPages(compressedPdf);
 
             if (newPages == 1) {
-                log.info("job={} fit-page Tier 2 SUCCESS: now 1 page", jobId);
+                log.info("job={} project={} fit-page Tier 2 SUCCESS: now 1 page", jobId, project);
                 return new FitPageResult(compressedLatex, compressedPdf);
             }
 
-            log.info("job={} fit-page Tier 2 insufficient ({} pages) — escalating to Tier 3",
-                    jobId, newPages);
-            // Use compressed as base for Tier 3
+            log.info("job={} project={} fit-page Tier 2 insufficient ({} pages) — escalating to Tier 3",
+                    jobId, project, newPages);
             latex = compressedLatex;
             pages = newPages;
 
         } catch (LatexCompileException ex) {
-            log.warn("job={} fit-page Tier 2 compile failed — escalating to Tier 3: {}",
-                    jobId, ex.getMessage());
+            log.warn("job={} project={} fit-page Tier 2 compile failed — escalating to Tier 3: {}",
+                    jobId, project, ex.getMessage());
         } catch (Exception ex) {
-            log.warn("job={} fit-page Tier 2 LLM failed — escalating to Tier 3: {}",
-                    jobId, ex.getMessage());
+            log.warn("job={} project={} fit-page Tier 2 LLM failed — escalating to Tier 3: {}",
+                    jobId, project, ex.getMessage());
         }
 
-        // Tier 3: content trim — last resort
-        try {
-            log.info("job={} fit-page Tier 3: content trim ({} pages)", jobId, pages);
-            String trimmedLatex = gemini.generateLatex(
-                    latexPrompts.latexSystemInstruction(),
-                    latexPrompts.contentTrimPrompt(latex, pages)
-            );
-            byte[] trimmedPdf = compiler.compile(trimmedLatex);
-            int newPages = countPdfPages(trimmedPdf);
-            log.info("job={} fit-page Tier 3 result: {} page(s)", jobId, newPages);
-            return new FitPageResult(trimmedLatex, trimmedPdf);
+//        // Tier 3: content trim — last resort
+//        try {
+//            log.info("job={} project={} fit-page Tier 3: content trim ({} pages)",
+//                    jobId, project, pages);
+//            String trimmedLatex = gemini.generateLatex(
+//                    keyId,
+//                    latexPrompts.latexSystemInstruction(),
+//                    latexPrompts.contentTrimPrompt(latex, pages)
+//            );
+//            byte[] trimmedPdf = compiler.compile(trimmedLatex);
+//            int newPages = countPdfPages(trimmedPdf);
+//            log.info("job={} project={} fit-page Tier 3 result: {} page(s)",
+//                    jobId, project, newPages);
+//            return new FitPageResult(trimmedLatex, trimmedPdf);
+//
+//        } catch (LatexCompileException ex) {
+//            log.warn("job={} project={} fit-page Tier 3 compile failed — returning best available: {}",
+//                    jobId, project, ex.getMessage());
+//        } catch (Exception ex) {
+//            log.warn("job={} project={} fit-page Tier 3 LLM failed — returning best available: {}",
+//                    jobId, project, ex.getMessage());
+//        }
 
-        } catch (LatexCompileException ex) {
-            log.warn("job={} fit-page Tier 3 compile failed — returning best available result: {}",
-                    jobId, ex.getMessage());
-        } catch (Exception ex) {
-            log.warn("job={} fit-page Tier 3 LLM failed — returning best available result: {}",
-                    jobId, ex.getMessage());
-        }
-
-        // All tiers failed — return whatever we had going in (non-fatal)
-        log.warn("job={} fit-page: all tiers exhausted — using pre-fit result", jobId);
+        log.warn("job={} project={} fit-page: all tiers exhausted — using pre-fit result",
+                jobId, project);
         return new FitPageResult(latex, pdf);
     }
 
@@ -350,15 +399,17 @@ public class LatexReshapeOrchestrator {
 
     private ResumePlan runPlanner(UUID jobId,
                                   String resumeText,
-                                  LatexReshapeRequest req) {
+                                  ResumeJob job,
+                                  String keyId) {
         try {
             Map<String, Object> raw = gemini.generateJson(
+                    keyId,
                     latexPrompts.plannerSystemInstruction(),
                     latexPrompts.resumePlannerPrompt(
                             resumeText,
-                            req.getRoleLabel(),
-                            req.getRoleCategory() != null ? req.getRoleCategory() : "",
-                            req.getJdText()
+                            job.getRoleLabel(),
+                            job.getRoleCategory() != null ? job.getRoleCategory() : "",
+                            job.getJdText()
                     )
             );
             return parsePlan(raw);
@@ -474,6 +525,7 @@ public class LatexReshapeOrchestrator {
                            String roleLabel) {
         try {
             Map<String, Object> scores = gemini.generateJson(
+                    null,
                     "You are an ATS scoring assistant. Return only JSON.",
                     latexPrompts.atsScorePrompt(originalText, shapedLatex, roleLabel)
             );
@@ -485,10 +537,12 @@ public class LatexReshapeOrchestrator {
             if (after instanceof Number n) job.setAtsScoreAfter(n.intValue());
 
             jobRepository.save(job);
-            log.debug("job={} atsScoreAfter={} (LLM adversarial)", jobId, job.getAtsScoreAfter());
+            log.info("job={} project=async atsScoreAfter={} (LLM adversarial)",
+                    jobId, job.getAtsScoreAfter());
 
         } catch (Exception ex) {
-            log.warn("job={} LLM ATS scoring failed (non-fatal): {}", jobId, ex.getMessage());
+            log.warn("job={} project=async LLM ATS scoring failed (non-fatal): {}",
+                    jobId, ex.getMessage());
         }
     }
 
@@ -574,8 +628,28 @@ public class LatexReshapeOrchestrator {
             return s;
         }
 
+        for (Map.Entry<String, Object> entry : result.entrySet()) {
+            if (entry.getValue() instanceof String s
+                    && s.contains("\\documentclass")
+                    && s.length() > MIN_LATEX_FIX_LENGTH) {
+                log.warn("Fix prompt returned LaTeX under unexpected key='{}' — using it anyway",
+                        entry.getKey());
+                return s;
+            }
+        }
+
+        log.error("Fix prompt returned unrecognised keys: {} — full response: {}",
+                result.keySet(),
+                result.entrySet().stream()
+                        .map(e -> e.getKey() + "=" +
+                                (e.getValue() instanceof String s
+                                        ? s.substring(0, Math.min(120, s.length())) + "…"
+                                        : e.getValue()))
+                        .toList());
+
         throw new AppException(
-                "LLM did not return 'fixedLatex' or 'shapedLatex' in fix response",
+                "LLM did not return 'fixedLatex' or 'shapedLatex' in fix response. " +
+                        "Keys received: " + result.keySet(),
                 HttpStatus.INTERNAL_SERVER_ERROR);
     }
 

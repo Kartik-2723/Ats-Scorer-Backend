@@ -11,11 +11,7 @@ import java.util.concurrent.Executor;
 @EnableAsync
 public class AsyncConfig {
 
-    /**
-     * Dedicated thread pool for the LLM pipeline.
-     * Gemini calls can take 20-60s; we keep a small pool to avoid
-     * exhausting the default Spring task executor.
-     */
+    /** LLM pipeline thread pool — used by @Async scoreAsync and any remaining @Async methods. */
     @Bean(name = "llmExecutor")
     public Executor llmExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
@@ -25,6 +21,24 @@ public class AsyncConfig {
         executor.setThreadNamePrefix("llm-pipeline-");
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(60);
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Dedicated pool for ResumeWorker BLPOP loops.
+     * corePoolSize must match ResumeWorker.NUM_WORKERS.
+     * These threads block on Redis — keep them separate from llmExecutor.
+     */
+    @Bean(name = "workerExecutor")
+    public Executor workerExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);      // = ResumeWorker.NUM_WORKERS
+        executor.setMaxPoolSize(4);       // no burst — BLPOP threads are always alive
+        executor.setQueueCapacity(0);     // reject immediately if all 4 slots taken (startup guard)
+        executor.setThreadNamePrefix("resume-worker-");
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(35); // > BLPOP_TIMEOUT_SEC so loops can exit cleanly
         executor.initialize();
         return executor;
     }

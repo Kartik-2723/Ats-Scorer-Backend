@@ -85,12 +85,20 @@ public class S3FileStorageService {
     }
 
     // ── Download ─────────────────────────────────────────────
-
     public InputStream download(String key) {
         return s3.getObject(GetObjectRequest.builder()
                 .bucket(cfg.getBucket())
                 .key(key)
                 .build());
+    }
+
+    public byte[] downloadBytes(String key) {
+        try (InputStream is = download(key)) {
+            return is.readAllBytes();
+        } catch (IOException ex) {
+            log.error("S3 download failed for key={}", key, ex);
+            throw new AppException("Failed to download file from storage", HttpStatus.INTERNAL_SERVER_ERROR);
+        }
     }
 
     /**
@@ -124,4 +132,6 @@ public class S3FileStorageService {
         if (filename == null) return "upload";
         return filename.replaceAll("[^a-zA-Z0-9._-]", "_");
     }
+
+
 }

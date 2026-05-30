@@ -4,6 +4,7 @@ import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.List;
 
 @Data
@@ -31,13 +32,27 @@ public class AppProperties {
         private int sessionTtlHours = 24;
     }
 
+    // Add inside your existing AppProperties.Gemini inner class:
+
     @Data
     public static class Gemini {
-        private String apiKey;
-        private List<String> models = List.of("gemini-2.5-flash");  // String model → List<String> models
-        private String baseUrl = "https://generativelanguage.googleapis.com/v1beta";
-        private int timeoutSeconds = 60;
-        private int maxOutputTokens = 8192;
+        private String   apiKey;          // single-key fallback
+        private List<String> models;
+        private String   baseUrl;
+        private int      timeoutSeconds = 60;
+        private int      maxOutputTokens = 8192;
+
+        // ── NEW: multi-key pool ──────────────────────────────────────────────────
+        private List<KeyEntry> keyPool = new ArrayList<>();
+        @Data
+        public static class KeyEntry {
+            /** Logical name, e.g. "project-alpha". Used in Redis keys and logs. */
+            private String id;
+            /** Raw GCP API key string for this project. */
+            private String apiKey;
+            /** RPM quota limit for this project — used for weighted scheduling. */
+            private int quota = 100;
+        }
     }
 
     @Data

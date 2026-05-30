@@ -24,16 +24,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-/**
- * Endpoints for the LaTeX reshape pipeline.
- *
- * POST /api/latex/reshape              — submit PDF or .tex file
- * GET  /api/latex/reshape/{id}/status  — poll until DONE | FAILED
- * GET  /api/latex/reshape/{id}/result  — fetch full result when DONE
- *
- * FIX 5: result endpoint now maps contentFlags, atsGapKeywords,
- * profileTypeDetected, and atsReport into LatexReshapeResponse.
- */
 @Slf4j
 @RestController
 @RequestMapping("/api/latex/reshape")
@@ -58,12 +48,12 @@ public class LatexReshapeController {
 
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<ApiResponse<Map<String, Object>>> submit(
-            @RequestParam("file")                                    MultipartFile file,
-            @RequestParam("roleLabel")                               String roleLabel,
-            @RequestParam(value = "roleCategory",  required = false) String roleCategory,
+            @RequestParam("file")                                         MultipartFile file,
+            @RequestParam("roleLabel")                                    String roleLabel,
+            @RequestParam(value = "roleCategory",  required = false)      String roleCategory,
             @RequestParam(value = "customRole",    defaultValue = "false") boolean customRole,
-            @RequestParam(value = "jdText",        required = false) String jdText,
-            @RequestParam(value = "guestToken",    required = false) String guestToken,
+            @RequestParam(value = "jdText",        required = false)       String jdText,
+            @RequestParam(value = "guestToken",    required = false)       String guestToken,
             @AuthenticationPrincipal User user
     ) throws IOException {
 
@@ -96,6 +86,39 @@ public class LatexReshapeController {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // POST /api/latex/reshape/{jobId}/reshape  — retry existing job
+    // Resets the job to PENDING and re-enqueues the pipeline.
+    // The original file is already on S3 — no re-upload needed.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @PostMapping("/{jobId}/reshape")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> retrigger(
+            @PathVariable UUID jobId,
+            @RequestParam(required = false) String guestToken,
+            @AuthenticationPrincipal User user
+    ) {
+        validateOwner(guestToken, user);
+
+        ResumeJob job = findAndAuthorize(jobId, guestToken, user);
+
+        if (job.getOriginalFileKey() == null || job.getOriginalFileKey().isBlank()) {
+            throw new AppException(
+                    "Cannot retry — original file no longer available on storage.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        log.info("LaTeX reshape retrigger: jobId={} user/guest={}",
+                jobId, user != null ? user.getEmail() : guestToken);
+
+        orchestrator.retrigger(job);
+
+        return ResponseEntity.accepted().body(ApiResponse.success(Map.of(
+                "jobId",  job.getId(),
+                "status", JobStatus.PENDING
+        )));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // GET /api/latex/reshape/{jobId}/status
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -121,7 +144,6 @@ public class LatexReshapeController {
 
     // ─────────────────────────────────────────────────────────────────────────
     // GET /api/latex/reshape/{jobId}/result
-    // FIX 5: maps contentFlags, atsGapKeywords, profileTypeDetected, atsReport
     // ─────────────────────────────────────────────────────────────────────────
 
     @GetMapping("/{jobId}/result")
@@ -132,25 +154,21 @@ public class LatexReshapeController {
     ) {
         ResumeJob job = findAndAuthorize(jobId, guestToken, user);
 
-        // LatexReshapeController.java — result endpoint
         if (job.getStatus() != JobStatus.DONE) {
             return ResponseEntity.status(HttpStatus.ACCEPTED)
-                    .body(ApiResponse.success((LatexReshapeResponse) Map.of(   // or a typed wrapper
-                            "status", job.getStatus(),
+                    .body(ApiResponse.success((LatexReshapeResponse) Map.of(
+                            "status",  job.getStatus(),
                             "message", "Job not complete yet"
                     )));
         }
 
         String pdfUrl = storage.presignedUrl(job.getCompiledPdfKey());
 
-        // Parse changesLog from shapedResume JSONB
         @SuppressWarnings("unchecked")
         List<String> changesLog = job.getShapedResume() != null
                 ? (List<String>) job.getShapedResume().getOrDefault("changesLog", List.of())
                 : List.of();
 
-        // FIX 5: reconstruct ATSReport from stored atsReport JSONB
-        // Falls back to null gracefully if not yet computed
         ATSReport atsReport = buildAtsReportFromJob(job);
 
         LatexReshapeResponse response = LatexReshapeResponse.builder()
@@ -161,7 +179,6 @@ public class LatexReshapeController {
                 .atsScoreAfter(job.getAtsScoreAfter())
                 .changesLog(changesLog)
                 .compileAttempts(job.getLatexCompileAttempts())
-                // FIX 5: new fields
                 .profileTypeDetected(job.getProfileTypeDetected())
                 .atsGapKeywords(job.getAtsGapKeywords() != null
                         ? job.getAtsGapKeywords() : List.of())
@@ -189,12 +206,6 @@ public class LatexReshapeController {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * FIX 5: Reconstruct ATSReport from the atsReport JSONB column.
-     * Stored as Map by the orchestrator, reconstructed here for type-safe response.
-     * Returns null gracefully if the rules-based scorer hasn't run yet
-     * (e.g. old jobs created before this fix was deployed).
-     */
     @SuppressWarnings("unchecked")
     private ATSReport buildAtsReportFromJob(ResumeJob job) {
         Map<String, Object> raw = job.getAtsReport();

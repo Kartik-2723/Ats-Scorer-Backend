@@ -78,4 +78,6 @@ public interface ResumeJobRepository extends JpaRepository<ResumeJob, UUID>,
     boolean hasActiveUserJob(@Param("userId")   UUID userId,
                              @Param("statuses") List<JobStatus> statuses,
                              @Param("since")    OffsetDateTime since);
+
+    List<ResumeJob> findAllByGuestTokenIn(List<String> tokens);
 }

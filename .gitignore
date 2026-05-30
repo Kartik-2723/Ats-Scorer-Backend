@@ -1,6 +1,9 @@
 # Env
 .env
 *.env
+.application.yml
+*.application.yml
+
 
 # Maven
 target/
