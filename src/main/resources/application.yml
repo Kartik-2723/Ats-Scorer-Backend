@@ -4,9 +4,9 @@ spring:
 
   # ── Database ───────────────────────────────────────────────
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/resumeshaper}
-    username: ${DB_USERNAME:resumeshaper}
-    password: ${DB_PASSWORD:resumeshaper}
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
     hikari:
       maximum-pool-size: 10
       minimum-idle: 2
@@ -34,7 +34,7 @@ spring:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:}
-      timeout: 2000ms
+      timeout: 35000ms
 
   # ── Mail (Gmail) ───────────────────────────────────────────
   mail:
@@ -107,16 +107,60 @@ app:
 
   # Gemini
   gemini:
-    api-key: ${GEMINI_API_KEY}
+    api-key: ${GEMINI_API_KEY}    # single-key fallback — used by scoreAsync and if key-pool is empty
     models:
       - gemini-2.5-flash          # smartest — 20 RPD, first choice
       - gemini-3.1-flash-lite     # 500 RPD — main workhorse
       - gemma-4-31b-it            # ✅ confirmed exact ID — 1.5K RPD
-      - gemma-4-26b-a4b-it        # ✅ confirmed exact ID (was wrong before) — 1.5K RPD
+      - gemma-4-26b-a4b-it        # ✅ confirmed exact ID — 1.5K RPD
       - gemini-2.5-flash-lite     # last resort — 20 RPD
     base-url: https://generativelanguage.googleapis.com/v1beta
     timeout-seconds: 60
     max-output-tokens: 8192
+
+    # ── Multi-project API key pool ──────────────────────────
+    # Each entry = a different GCP project with its own quota bucket.
+    # quota = RPM limit for that project (used for weighted scheduling).
+    # Score = active_count / quota → lower score = gets next request.
+    # Projects with higher quota naturally absorb more traffic.
+    # Add/remove entries freely — pool re-initialises on every restart.
+    key-pool:
+      - id: project-01
+        api-key: ${GEMINI_KEY_01}
+        quota: 100
+      - id: project-02
+        api-key: ${GEMINI_KEY_02}
+        quota: 100
+      - id: project-03
+        api-key: ${GEMINI_KEY_03}
+        quota: 100
+      - id: project-04
+        api-key: ${GEMINI_KEY_04}
+        quota: 100
+      - id: project-05
+        api-key: ${GEMINI_KEY_05}
+        quota: 100
+      - id: project-06
+        api-key: ${GEMINI_KEY_06}
+        quota: 100
+      - id: project-07
+        api-key: ${GEMINI_KEY_07}
+        quota: 100
+      - id: project-08
+        api-key: ${GEMINI_KEY_08}
+        quota: 100
+      - id: project-09
+        api-key: ${GEMINI_KEY_09}
+        quota: 100
+      - id: project-10
+        api-key: ${GEMINI_KEY_10}
+        quota: 100
+      - id: project-11
+        api-key: ${GEMINI_KEY_11}
+        quota: 100
+      - id: project-12
+        api-key: ${GEMINI_KEY_12}
+        quota: 100
 
   # AWS S3
   storage:
@@ -128,7 +172,6 @@ app:
   # CORS
   cors:
     allowed-origins: ${CORS_ORIGINS:http://localhost:5173}
-
 
   # OAuth2 redirect after login
   oauth2:
@@ -151,7 +194,7 @@ app:
     attempts-ttl-minutes: 15
     max-attempts: 5
 
-  #tectonic
+  # Tectonic
   latex:
     tectonic:
       path: ${app.latex.tectonic.path:tectonic}

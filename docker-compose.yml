@@ -11,10 +11,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Database
-      DB_URL:      jdbc:postgresql://postgres:5432/resumeshaper
-      DB_USERNAME: resumeshaper
-      DB_PASSWORD: resumeshaper
+      DB_URL: jdbc:postgresql://postgres:5432/${DB_NAME}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
 
       # Redis
       REDIS_HOST: redis
@@ -27,8 +26,22 @@ services:
       # JWT – generate with: openssl rand -base64 64
       JWT_SECRET: ${JWT_SECRET}
 
-      # Gemini
-      GEMINI_API_KEY: AIzaSyCjvX9TXt9P72NI2do9FWvqvaaOj7qrmyE
+      # Gemini fallback key
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+
+      # Gemini key pool (12 keys)
+      GEMINI_KEY_01: ${GEMINI_KEY_01}
+      GEMINI_KEY_02: ${GEMINI_KEY_02}
+      GEMINI_KEY_03: ${GEMINI_KEY_03}
+      GEMINI_KEY_04: ${GEMINI_KEY_04}
+      GEMINI_KEY_05: ${GEMINI_KEY_05}
+      GEMINI_KEY_06: ${GEMINI_KEY_06}
+      GEMINI_KEY_07: ${GEMINI_KEY_07}
+      GEMINI_KEY_08: ${GEMINI_KEY_08}
+      GEMINI_KEY_09: ${GEMINI_KEY_09}
+      GEMINI_KEY_10: ${GEMINI_KEY_10}
+      GEMINI_KEY_11: ${GEMINI_KEY_11}
+      GEMINI_KEY_12: ${GEMINI_KEY_12}
 
       # AWS S3
       S3_BUCKET:          ${S3_BUCKET}
@@ -45,6 +58,8 @@ services:
 
       # CORS
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
 
     depends_on:
       postgres:
@@ -66,13 +81,13 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_DB:       resumeshaper
-      POSTGRES_USER:     resumeshaper
-      POSTGRES_PASSWORD: resumeshaper
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U resumeshaper"]
+      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER" ]
       interval: 10s
       timeout: 5s
       retries: 5
