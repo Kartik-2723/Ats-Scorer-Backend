@@ -77,11 +77,12 @@ spring:
 # ── Server ─────────────────────────────────────────────────
 server:
   port: ${PORT:8080}
+  forward-headers-strategy: framework
   compression:
     enabled: true
     mime-types: application/json,application/octet-stream
   error:
-    include-message: never       # don't leak stack traces in prod
+    include-message: never    # don't leak stack traces in prod
 
 # ── Actuator ───────────────────────────────────────────────
 management:
